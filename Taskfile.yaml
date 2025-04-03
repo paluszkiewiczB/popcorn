@@ -1,0 +1,37 @@
+version: "3"
+
+tasks:
+
+  test:
+    desc: "Run all the tests"
+    cmds:
+      - go test -v ./...
+
+  lint:
+    desc: "Runs all the linters"
+    deps:
+      - deps
+    cmds:
+      - go tool golangci-lint run ./...
+
+  fix:
+    desc: "Automatically fixes all the code"
+    deps:
+      - deps
+    cmds:
+      - go tool gofumpt -extra -l -w .
+      - go tool golangci-lint run --fix ./...
+
+  deps:
+    desc: "Install all the dependencies"
+    cmds:
+      - go mod tidy
+      - go mod download
+    sources:
+      - go.mod
+    generates:
+      - go.sum
+
+  default:
+    cmds:
+      - task -l

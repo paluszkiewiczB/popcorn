@@ -177,17 +177,6 @@ func (s *eventStore) startStoring(c <-chan popcorn.Event) func() {
 	return cf
 }
 
-func must(err error) {
-	if err != nil {
-		log.Fatal(err)
-	}
-}
-
-func must2[T any](val T, err error) T {
-	must(err)
-	return val
-}
-
 func newIs(t *testing.T) *popIs {
 	return &popIs{I: is.New(t)}
 }

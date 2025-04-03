@@ -97,7 +97,6 @@ type Module struct {
 
 	c chan Event
 
-	setup SetupFunc
 	start StartFunc
 	stop  StopFunc
 }
@@ -408,12 +407,12 @@ func NewBus(cfg *BusCfg) (*Bus, error) {
 // Context is used to limit total time spent on sending, but additionally, a try of sending the message to the listener can time out.
 // Bus always tries to send the event to all the listeners, but will stop once context was canceled.
 func (b *Bus) Send(ctx context.Context, e Event) error {
-	l := b.l.With(attr.RandomID("eid"))
-	l.LogAttrs(ctx, slog.LevelInfo, "sending event", eventAttr(e))
-
 	if b == nil {
 		return nil
 	}
+
+	l := b.l.With(attr.RandomID("eid"))
+	l.LogAttrs(ctx, slog.LevelInfo, "sending event", eventAttr(e))
 
 	// ignore the cancellation signal to deliver the event to all the listeners - use the timeout instead
 	noCancCtx := context.WithoutCancel(ctx)

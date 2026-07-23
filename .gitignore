@@ -2,3 +2,10 @@
 .task
 
 .bin
+.tools
+bin/
+
+# Local environment overrides
+.envrc.local
+.droot.envrc.local
+

@@ -1,36 +1,73 @@
-version: "3"
+version: 3
+
+set: [pipefail]
+
+vars:
+  TOOL_BIN: "{{.ROOT_DIR}}/.tools"
+
+env:
+  GOTOOLCHAIN: go1.26.3+auto
+  CGO_ENABLED: 0
 
 tasks:
-
   test:
-    desc: "Run all the tests"
+    desc: "Run all tests with coverage for the core packages"
+    deps: [setup]
     cmds:
-      - go test -v ./...
+      - go test -count 1 -coverprofile=./bin/coverage.out ./...
 
-  lint:
-    desc: "Runs all the linters"
-    deps:
-      - deps
+  test:race:
+    desc: "Run all tests with race detector (requires cgo)"
+    deps: [setup]
+    env:
+      CGO_ENABLED: 1
     cmds:
-      - go tool golangci-lint run ./...
+      - go test -count 1 -race -coverpkg=./... ./...
 
-  fix:
-    desc: "Automatically fixes all the code"
-    deps:
-      - deps
+  run:
+    desc: "Run the example application"
+    deps: [setup]
     cmds:
-      - go tool gofumpt -extra -l -w .
-      - go tool golangci-lint run --fix ./...
+      - go run ./examples
+
+  test:reports:
+    desc: "Print total code coverage"
+    preconditions:
+      - test -f ./bin/coverage.out
+    cmds:
+      - go tool cover -func=./bin/coverage.out | awk '/total/{gsub("%","",$3); print $3}' > ./bin/totalCoverageReport.txt
+      - echo "Total code coverage is $(cat ./bin/totalCoverageReport.txt)%"
 
   deps:
-    desc: "Install all the dependencies"
+    desc: "Download module dependencies"
     cmds:
-      - go mod tidy
       - go mod download
-    sources:
-      - go.mod
-    generates:
-      - go.sum
+
+  fmt:
+    desc: "Format code with gofumpt"
+    deps: [tools]
+    cmds:
+      - "{{.TOOL_BIN}}/gofumpt -extra -l -w ."
+
+  lint:
+    desc: "Run linters"
+    deps: [tools]
+    cmds:
+      - '{{.TOOL_BIN}}/gofumpt -extra -l -e . | xargs --no-run-if-empty sh -c "echo ''code is not gofumpt-ed, run task fmt''; exit 1"'
+      - "{{.TOOL_BIN}}/golangci-lint run ./..."
+
+  tools:
+    desc: "Install tools from tools/go.mod into .tools/"
+    cmds:
+      - GOBIN={{.TOOL_BIN}} go -C tools install tool
+
+  setup:
+    desc: "Prepare local environment"
+    deps:
+      - tools
+      - deps
+    cmds:
+      - mkdir -p ./bin
 
   default:
     cmds:

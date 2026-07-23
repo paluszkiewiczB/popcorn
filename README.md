@@ -2,7 +2,7 @@
 
 Popcorn is a microframework following the micro kernel architecture.
 
-It's core takes care of a proper bootstrap and shutdown of your application, and does not care about functionality of your app.
+Its core takes care of a proper bootstrap and shutdown of your application, and does not care about functionality of your app.
 
 It does not matter whether you're going to have the HTTP server or CLI tool.
 

@@ -4,27 +4,32 @@ import (
 	"context"
 	"errors"
 	"fmt"
+	"log/slog"
+	"sort"
+	"sync"
+	"time"
+
 	"github.com/paluszkiewiczB/popcorn/plog"
 	"github.com/paluszkiewiczB/popcorn/plog/attr"
-	"log/slog"
-	"slices"
-	"sync"
-	"sync/atomic"
-	"time"
 )
 
+// ErrKernelUnhealthy is returned by [Kernel.Start] when the kernel health state becomes NOK.
 type ErrKernelUnhealthy struct {
-	cause error
+	// Cause is the underlying reason the kernel became unhealthy.
+	Cause error
 }
 
+// Error implements the error interface.
 func (e ErrKernelUnhealthy) Error() string {
-	return fmt.Sprintf("kernel is unhealthy, %s", e.cause)
+	return fmt.Sprintf("kernel is unhealthy: %s", e.Cause)
 }
 
+// Unwrap returns the cause of the error.
 func (e ErrKernelUnhealthy) Unwrap() error {
-	return e.cause
+	return e.Cause
 }
 
+// ModuleState represents the health state of a module or the kernel.
 type ModuleState int32
 
 func (s ModuleState) asInt() int32 {
@@ -32,438 +37,378 @@ func (s ModuleState) asInt() int32 {
 }
 
 const (
+	// ModuleStateUnknown is the initial state of a module.
 	ModuleStateUnknown ModuleState = iota
+	// ModuleStateOK means the module is healthy.
 	ModuleStateOK
+	// ModuleStateNOK means the module is unhealthy.
 	ModuleStateNOK
+	// ModuleStateTempNOK means the module is temporarily unhealthy.
 	ModuleStateTempNOK
 )
 
-// The ModuleStateStore stores a ModuleState
-type ModuleStateStore atomic.Int32
+// EventSourceKernel is the reserved source identifier for events emitted by the [Kernel].
+const EventSourceKernel = "kernel"
 
-func (s *ModuleStateStore) Set(state ModuleState) {
-	s.asAtomic().Store(state.asInt())
+// Kernel manages the lifecycle of a set of [Module]s.
+type Kernel struct {
+	modules        []Module
+	order          []Module
+	started        []Module
+	stopFuncs      map[string]StopFunc
+	bus            *Bus
+	log            plog.Logger
+	healthTick     time.Duration
+	stopTimeout    time.Duration
+	state          *moduleStateStore
+	nokModuleID    string
+	cancelListener func()
 }
 
-func (s *ModuleStateStore) CAS(from, to ModuleState) bool {
-	return s.asAtomic().CompareAndSwap(from.asInt(), to.asInt())
+type kernelConfig struct {
+	bus         *Bus
+	log         plog.Logger
+	modules     []Module
+	healthTick  time.Duration
+	stopTimeout time.Duration
 }
 
-func (s *ModuleStateStore) Get() ModuleState {
-	return ModuleState(s.asAtomic().Load())
+// KernelOption configures a [Kernel].
+type KernelOption func(*kernelConfig) error
+
+// WithBus sets the event bus used by the kernel.
+func WithBus(b *Bus) KernelOption {
+	return func(c *kernelConfig) error {
+		c.bus = b
+		return nil
+	}
 }
 
-func (s *ModuleStateStore) asAtomic() *atomic.Int32 {
-	return (*atomic.Int32)(s)
+// WithLogger sets the logger used by the kernel.
+func WithLogger(l *slog.Logger) KernelOption {
+	return func(c *kernelConfig) error {
+		c.log = l
+		return nil
+	}
 }
 
-// SetupFunc is a function used to set up (initialize) a [Module].
-// Context passed to this function can time out - you must not retain it.
-type SetupFunc func(ctx context.Context) error
-
-// StartFunc is a function used to start a [Module].
-// If the returned StopFunc is non-nil, it will be invoked to stop the module during [Kernel] shutdown.
-// StartFunc *must not* retain the context - [Kernel] might cancel it to limit time spent on a StartFunc (timeout).
-// To reuse values passed in the context, use [RetainContext] or [RetainContextCause].
-type StartFunc func(ctx context.Context) (StopFunc, error)
-
-// RetainContext returns a new context with new [context.CancelFunc].
-func RetainContext(ctx context.Context) (context.Context, func()) {
-	retained := context.WithoutCancel(ctx)
-	return context.WithCancel(retained)
+// WithModules adds modules to the kernel.
+func WithModules(modules ...Module) KernelOption {
+	return func(c *kernelConfig) error {
+		c.modules = append(c.modules, modules...)
+		return nil
+	}
 }
 
-// RetainContextCause returns a new context with new [context.CancelCauseFunc].
-func RetainContextCause(ctx context.Context) (context.Context, func(error)) {
-	retained := context.WithoutCancel(ctx)
-	return context.WithCancelCause(retained)
+// WithHealthTick sets the interval between health checks.
+func WithHealthTick(d time.Duration) KernelOption {
+	return func(c *kernelConfig) error {
+		c.healthTick = d
+		return nil
+	}
 }
 
-// StopFunc is invoked to stop a [Module].
-// It should clean all the resources allocated during the startup process, background jobs, etc.
-type StopFunc func(ctx context.Context) (err error)
-
-func NoStop(err ...error) (StopFunc, error) {
-	return nil, errors.Join(err...)
+// WithStopTimeout sets the timeout for the shutdown phase.
+func WithStopTimeout(d time.Duration) KernelOption {
+	return func(c *kernelConfig) error {
+		c.stopTimeout = d
+		return nil
+	}
 }
 
-// Module represents a module of a Popcorn framework.
-// It should be a self-containing piece of code, knowing how to properly start and stop itself.
-// Kernel manages a lifecycle of a Module.
-type Module struct {
-	id               string   // it is recommended to use a full Go mod path as a module id, e.g. "github.com/paluszkiewiczB/popcorn/modules/sql"
-	dependencies     []string // startup dependencies
-	dependenciesLeft []string // startup dependencies, mutable during startup
-
-	c chan Event
-
-	start StartFunc
-	stop  StopFunc
-}
-
-// ModRecipe is a recipe used to create a [Module].
-type ModRecipe struct {
-	// ID of the module.
-	// Must not be empty.
-	// Must be different from [EventSourceKernel].
-	// Must be unique - [Kernel] won't start with two modules having the same ID.
-	//
-	// It is recommended to use a full import path of the module as a 'prefix' of the ID.
-	ID string
-	// Dependencies are IDs of modules, which must be started before this one.
-	Dependencies []string
-	// Start is a non-nil function called, when the [Module] is started. See [StartFunc] docs.
-	Start StartFunc
-	// EventsChan is an optional channel, which will be used to notify the [Module] about in-app Events.
-	// Events are not sent before Start is called.
-	// After the successful start of a module, this channel will receive all the events that took place before this Module was started, then the ModuleStarted event.
-	EventsChan chan Event
-}
-
-func (c ModRecipe) validate() error {
-	if len(c.ID) == 0 {
-		return fmt.Errorf("id not set")
+// NewKernel creates a new [Kernel] with the given options.
+func NewKernel(opts ...KernelOption) (*Kernel, error) {
+	cfg := kernelConfig{
+		log:         slog.Default(),
+		healthTick:  time.Second,
+		stopTimeout: 5 * time.Second,
+	}
+	for _, opt := range opts {
+		if err := opt(&cfg); err != nil {
+			return nil, fmt.Errorf("applying kernel option: %w", err)
+		}
 	}
 
-	if EventSourceKernel == c.ID {
-		return fmt.Errorf("cannot use module id '%s' - it is reserved by the kernel", EventSourceKernel)
+	if cfg.bus == nil {
+		b, err := NewBus()
+		if err != nil {
+			return nil, fmt.Errorf("creating default bus: %w", err)
+		}
+		cfg.bus = b
 	}
 
-	if c.Start == nil {
-		return fmt.Errorf("start function not set")
+	ids := make(map[string]struct{}, len(cfg.modules))
+	for _, m := range cfg.modules {
+		if m == nil {
+			return nil, fmt.Errorf("nil module")
+		}
+		if _, ok := ids[m.ID()]; ok {
+			return nil, fmt.Errorf("duplicate module id: %s", m.ID())
+		}
+		ids[m.ID()] = struct{}{}
+	}
+
+	order, err := resolveDependencies(cfg.modules)
+	if err != nil {
+		return nil, fmt.Errorf("resolving dependencies: %w", err)
+	}
+
+	return &Kernel{
+		state:       &moduleStateStore{},
+		modules:     cfg.modules,
+		order:       order,
+		stopFuncs:   make(map[string]StopFunc),
+		bus:         cfg.bus,
+		healthTick:  cfg.healthTick,
+		stopTimeout: cfg.stopTimeout,
+		log:         cfg.log,
+	}, nil
+}
+
+// Start starts all modules in dependency order and blocks until the context is canceled,
+// a module reports NOK, or all [TaskModule]s are done.
+func (k *Kernel) Start(ctx context.Context) error {
+	//CR: are you sure it's thread safe?
+	// SetBuffering(false), reading from the buffer and then clearing it are not atomic
+	// so an event emitted just after the startup might be LOST due to time-of-check vs time-of-delete data race
+	k.bus.SetBuffering(true)
+	defer k.bus.SetBuffering(false)
+	defer k.bus.ClearBuffer()
+
+	kernelEvents := make(chan Event, 1)
+	//CR: should we use background here?
+	listenCtx, cancel := context.WithCancel(context.Background())
+	k.cancelListener = cancel
+	go k.listener(listenCtx, kernelEvents)
+
+	if err := k.bus.Subscribe(EventSourceKernel, kernelEvents); err != nil {
+		return fmt.Errorf("subscribing kernel to bus: %w", err)
+	}
+	defer k.bus.Unsubscribe(EventSourceKernel)
+
+	if err := k.startModules(ctx); err != nil {
+		return err
+	}
+
+	return k.run(ctx)
+}
+
+func (k *Kernel) listener(ctx context.Context, ch <-chan Event) {
+	for {
+		select {
+		case <-ctx.Done():
+			return
+		case e := <-ch:
+			k.handleEvent(e)
+		}
+	}
+}
+
+func (k *Kernel) startModules(ctx context.Context) error {
+	k.log.LogAttrs(ctx, slog.LevelInfo, "starting the kernel", slog.Int("modCount", len(k.modules)))
+
+	for _, m := range k.order {
+		id := m.ID()
+		k.log.LogAttrs(ctx, slog.LevelInfo, "starting module", attr.ModID(id))
+
+		start := time.Now()
+		stopFunc, err := m.Start(ctx)
+		if err != nil {
+			return fmt.Errorf("starting module %s: %w", id, err)
+		}
+
+		k.started = append(k.started, m)
+		k.stopFuncs[id] = stopFunc
+
+		if er, ok := m.(EventReceiver); ok {
+			if ch := er.Events(); ch != nil {
+				if err := k.bus.Subscribe(id, ch); err != nil {
+					return fmt.Errorf("subscribing module %s to bus: %w", id, err)
+				}
+				//CR: event will not receive ALL the events, just those buffered before it started up
+				// but it will never receive an event buffered AFTER it started up, right? since buffering was enabled
+				k.replayStartupEvents(ctx, ch)
+			}
+		}
+
+		if err := k.bus.Send(ctx, NewEvent[ModuleStarted](EventSourceKernel, ModuleStarted{
+			ID:        id,
+			Order:     len(k.started) - 1,
+			StartTook: time.Since(start),
+		})); err != nil {
+			return fmt.Errorf("sending ModuleStarted event: %w", err)
+		}
 	}
 
 	return nil
 }
 
-func NewModule(cfg ModRecipe) (*Module, error) {
-	if err := cfg.validate(); err != nil {
-		return nil, fmt.Errorf("creating new module with invalid configuration: %v, %w", cfg, err)
-	}
-
-	return &Module{
-		id:               cfg.ID,
-		dependencies:     cfg.Dependencies,
-		dependenciesLeft: slices.Clone(cfg.Dependencies),
-		c:                cfg.EventsChan,
-		start:            cfg.Start,
-	}, nil
-}
-
-type Kernel struct {
-	state          *ModuleStateStore
-	modules        []*Module
-	startedModules []*Module
-
-	b              *Bus
-	cancelListener func(error)
-
-	healthTick  time.Duration
-	stopTimeout time.Duration
-
-	l plog.Slog
-}
-
-func NewKernel(b *Bus, l plog.Slog, mods ...*Module) (*Kernel, error) {
-	ids := make(map[string]int)
-	for i, mod := range mods {
-		if oldIndex, ok := ids[mod.id]; ok {
-			return nil, fmt.Errorf("duplicate module id: %s, passed at indexes: %d and %d", mod.id, oldIndex, i)
-		} else {
-			ids[mod.id] = i
-		}
-	}
-
-	if l == nil {
-		l = slog.Default()
-		l.LogAttrs(context.Background(), slog.LevelWarn, "logger was nil, using default one")
-	}
-
-	if b.timeout == 0 {
-		b.timeout = time.Second
-	}
-
-	if b.l == nil {
-		b.l = l
-	}
-
-	return &Kernel{
-		state:       &ModuleStateStore{},
-		modules:     mods,
-		b:           b,
-		stopTimeout: time.Second * 5,
-		healthTick:  time.Second,
-		l:           l,
-	}, nil
-}
-
-func (k *Kernel) Start(ctx context.Context) error {
-	if k.b != nil {
-		k.b.shouldBuf.Store(true)
-		listenCtx, cf := context.WithCancelCause(ctx)
-		k.cancelListener = cf
-
-		c := make(chan Event, 10)
-		k.b.listeners[EventSourceKernel] = c
-		go func() {
-			for {
-				select {
-				case <-listenCtx.Done():
-					k.l.LogAttrs(ctx, slog.LevelInfo, "listening for events by the Kernel was canceled", attr.Err(listenCtx.Err()))
-					return
-				case e := <-c:
-					k.handleEvent(ctx, e)
-				}
-			}
-		}()
-	}
-
-	addListener := func(m *Module) {
-		if k.b != nil && m.c != nil {
-			k.l.LogAttrs(ctx, slog.LevelInfo, "adding new event listener", attr.ModId(m.id), attr.Chan(m.c))
-			k.b.listeners[m.id] = m.c
-		}
-	}
-
-	k.l.LogAttrs(ctx, slog.LevelInfo, "starting the kernel", slog.Int("modCount", len(k.modules)))
-	started := make(map[string]struct{}, len(k.modules))
-	left := make(map[string]*Module)
-
-	// key is module id, value is a list of other modules depending on the key module
-	dependents := make(map[string][]string)
-
-	for _, mod := range k.modules {
-		id := mod.id
-		left[id] = mod
-		for _, depId := range mod.dependencies {
-			k.l.LogAttrs(ctx, slog.LevelInfo, "module has a dependency", attr.ModId(id), slog.String("dependsOn", depId))
-			dependents[depId] = append(dependents[depId], id)
-		}
-	}
-
-	var i int
-	// FIXME this will block forever if there is a circular dependency
-	//  build a dependency tree here
-	for len(left) != 0 {
-		newStarted := make([]string, 0)
-		for id, mod := range left {
-			k.l.LogAttrs(ctx, slog.LevelInfo, "trying to start module", attr.ModId(id), slog.Int("depsLeft", len(mod.dependenciesLeft)))
-			if len(mod.dependenciesLeft) == 0 {
-				k.l.LogAttrs(ctx, slog.LevelInfo, "module has no dependencies left, starting", attr.ModId(id))
-
-				start := time.Now()
-				stop, err := mod.start(ctx)
-				if err != nil {
-					// TODO: stop all the modules that were started
-					return fmt.Errorf("starting a module: %s, %w", id, err)
-				}
-
-				if stop != nil {
-					mod.stop = stop
-				}
-
-				k.l.LogAttrs(ctx, slog.LevelInfo, "module started", attr.ModId(id))
-				started[id] = struct{}{}
-				newStarted = append(newStarted, id)
-				k.l.LogAttrs(ctx, slog.LevelInfo, "notifying dependent modules", slog.Any("dependents", dependents[id]))
-				for _, dep := range dependents[id] {
-					left[dep].dependenciesLeft = slices.DeleteFunc(left[dep].dependenciesLeft, func(s string) bool { return s == id })
-				}
-				addListener(mod)
-				for _, bufd := range k.b.cloneBuf() {
-					err := k.b.Send(ctx, bufd)
-					if err != nil {
-						return fmt.Errorf("sending buffored event, %w", err)
-					}
-				}
-				err = k.b.Send(ctx, newKernelEvent(ModuleStarted{
-					ID:        id,
-					Order:     i,
-					StartTook: time.Since(start),
-				}))
-
-				if err != nil {
-					return fmt.Errorf("sending ModuleStarted event, %w", err)
-				}
-			}
-
-			i++
-		}
-
-		for _, id := range newStarted {
-			delete(left, id)
-		}
-	}
-
-	k.b.shouldBuf.Store(false)
-
-	err := k.checkHealth(ctx)
-	stopCtx := ctx
-	if ctx.Err() != nil {
-		// context is already canceled, so we need to create a new one
-		stopCtx = context.Background()
-		if k.stopTimeout != 0 {
-			var cf func()
-			stopCtx, cf = context.WithTimeout(ctx, k.stopTimeout)
-			defer cf()
-		}
-
-	}
-
-	// TODO: consider returning nil, when non-nil errors are `context.Canceled`
-	stopErr := k.stop(stopCtx)
-	return errors.Join(err, stopErr)
-}
-
-func (k *Kernel) stop(ctx context.Context) error {
-	var errs []error
-	for _, module := range k.startedModules {
-		if module.stop != nil {
-			errs = append(errs, module.stop(ctx))
-		}
-	}
-
-	k.cancelListener(fmt.Errorf("kernel stopped"))
-	return errors.Join(errs...)
-}
-
-func (k *Kernel) handleEvent(ctx context.Context, event Event) {
-	k.l.LogAttrs(ctx, slog.LevelInfo, "kernel received the event", eventAttr(event))
-
-	switch p := event.Payload.(type) {
-	case ModuleStatusChanged:
-		if p.To == ModuleStateNOK {
-			k.state.Set(ModuleStateNOK)
+func (k *Kernel) replayStartupEvents(ctx context.Context, ch chan<- Event) {
+	for _, e := range k.bus.Buffer() {
+		select {
+		case <-ctx.Done():
 			return
+		case ch <- e:
 		}
-	case ModuleStarted:
-		for _, module := range k.modules {
-			if module.id == p.ID {
-				k.startedModules = append(k.startedModules, module)
-				return
-			}
-		}
-
-		k.l.LogAttrs(ctx, slog.LevelError, "received event with module ModID not matching any of the modules", attr.ModId(p.ID))
-	default:
-		k.l.LogAttrs(ctx, slog.LevelError, "unknown event type", attr.TypeOf("event", event))
 	}
 }
 
-func (k *Kernel) checkHealth(ctx context.Context) error {
+func resolveDependencies(modules []Module) ([]Module, error) {
+	byID := make(map[string]Module, len(modules))
+	for _, m := range modules {
+		byID[m.ID()] = m
+	}
+
+	for _, m := range modules {
+		for _, dep := range m.Dependencies() {
+			if _, ok := byID[dep]; !ok {
+				return nil, fmt.Errorf("module %q depends on unknown module %q", m.ID(), dep)
+			}
+			if dep == m.ID() {
+				return nil, fmt.Errorf("module %q depends on itself", m.ID())
+			}
+		}
+	}
+
+	//CR: what the fuck does the `degree` mean here?
+	inDegree := make(map[string]int, len(modules))
+	dependents := make(map[string][]string, len(modules))
+	for _, m := range modules {
+		inDegree[m.ID()] = len(m.Dependencies())
+		for _, dep := range m.Dependencies() {
+			dependents[dep] = append(dependents[dep], m.ID())
+		}
+	}
+
+	var ready []string
+	for id, deg := range inDegree {
+		if deg == 0 {
+			ready = append(ready, id)
+		}
+	}
+	sort.Strings(ready)
+
+	order := make([]Module, 0, len(modules))
+	for len(ready) > 0 {
+		id := ready[0]
+		ready = ready[1:]
+		order = append(order, byID[id])
+
+		for _, depID := range dependents[id] {
+			inDegree[depID]--
+			if inDegree[depID] == 0 {
+				ready = append(ready, depID)
+				sort.Strings(ready)
+			}
+		}
+	}
+
+	//CR: please explain why comapring the lens is enough to detect it?
+	// do we need to do it at the very end of the runtime? shouldn't we FIRST build the dependency tree
+	// and PREVENT the startup from happening? fail-fast approach
+	if len(order) != len(modules) {
+		return nil, fmt.Errorf("circular dependency detected")
+	}
+
+	return order, nil
+}
+
+func (k *Kernel) run(ctx context.Context) error {
+	taskDone := k.watchTasks()
+
 	ticker := time.NewTicker(k.healthTick)
+	defer ticker.Stop()
+
 	for {
 		select {
 		case <-ctx.Done():
-			k.l.LogAttrs(ctx, slog.LevelInfo, "context canceled, stopping the kernel", attr.Err(ctx.Err()))
-			return ctx.Err()
+			k.log.LogAttrs(ctx, slog.LevelInfo, "context canceled, stopping the kernel", attr.Err(ctx.Err()))
+			return k.stop(ctx.Err())
+		case <-taskDone:
+			//CR: what if we have a mix of task modules and long-runnnig modules?
+			// seems like we're about to stop the kernel
+			// please consider CLI like `psql` in non-interactive mode:
+			// - the databse-connector module can be long-lived (it opens the *sql.DB and does not know when to stop)
+			// - the input module reads from stdin, prints result to stdout and finishes (task)
+			// in this case your approach is ok
+			//
+			// on the other hand:
+			// - http backend exposing API
+			// - one of the modules is databse migration (like Flyway) which is a task
+			// - should the http server STOP when the task module is done?
+			// - can we delay starting of the HTTP module before migration module is done?
+			k.log.LogAttrs(ctx, slog.LevelInfo, "all task modules finished, stopping the kernel")
+			return k.stop(nil)
 		case <-ticker.C:
-			ks := k.state.Get()
-			k.l.LogAttrs(ctx, slog.LevelDebug, "read kernel state", slog.Any("state", ks))
-			if ks == ModuleStateNOK {
-				return ErrKernelUnhealthy{
-					cause: fmt.Errorf("kernel state is NOK"),
-				}
+			if k.state.Get() == ModuleStateNOK {
+				return k.stop(ErrKernelUnhealthy{Cause: fmt.Errorf("module %s reported NOK", k.nokModuleID)})
 			}
 		}
 	}
 }
 
-const EventSourceKernel = "kernel"
-
-type BusCfg struct {
-	SendEvtTimeout time.Duration
-	Slog           plog.Slog
-}
-
-type Bus struct {
-	listeners map[string]chan<- Event
-	timeout   time.Duration
-	l         plog.Slog
-
-	shouldBuf atomic.Bool
-	mux       sync.RWMutex
-	buf       []Event
-}
-
-func NewBus(cfg *BusCfg) (*Bus, error) {
-	timeout := time.Second
-	var l plog.Slog
-
-	if cfg != nil {
-		timeout = cfg.SendEvtTimeout
-		l = cfg.Slog
+func (k *Kernel) watchTasks() <-chan struct{} {
+	var wg sync.WaitGroup
+	hasTasks := false
+	for _, m := range k.started {
+		if tm, ok := m.(TaskModule); ok {
+			hasTasks = true
+			wg.Add(1)
+			go func(doneCh <-chan struct{}) {
+				defer wg.Done()
+				<-doneCh
+			}(tm.Done())
+		}
 	}
-
-	return &Bus{
-		listeners: make(map[string]chan<- Event),
-		timeout:   timeout,
-		l:         l,
-	}, nil
-}
-
-// Send sends the Event to all the listeners.
-// Every listener receives all the events, filtering must be implemented on the reader side.
-// Context is used to limit total time spent on sending, but additionally, a try of sending the message to the listener can time out.
-// Bus always tries to send the event to all the listeners, but will stop once context was canceled.
-func (b *Bus) Send(ctx context.Context, e Event) error {
-	if b == nil {
+	if !hasTasks {
 		return nil
 	}
+	done := make(chan struct{})
+	go func() {
+		wg.Wait()
+		close(done)
+	}()
+	return done
+}
 
-	l := b.l.With(attr.RandomID("eid"))
-	l.LogAttrs(ctx, slog.LevelInfo, "sending event", eventAttr(e))
-
-	// ignore the cancellation signal to deliver the event to all the listeners - use the timeout instead
-	noCancCtx := context.WithoutCancel(ctx)
-	sendCtx, cf := context.WithTimeout(noCancCtx, time.Second)
-	defer cf()
+func (k *Kernel) stop(cause error) error {
+	stopCtx, cancel := context.WithTimeout(context.Background(), k.stopTimeout)
+	defer cancel()
 
 	var errs []error
-	for id, c := range b.listeners {
-		l.LogAttrs(ctx, slog.LevelDebug, "sending event to listener", attr.ModId(id))
-		err := b.sendEvent(sendCtx, e, c)
-		if err != nil {
-			errs = append(errs, fmt.Errorf("sending event: %s to %s, %w", e, id, err))
+	if cause != nil {
+		errs = append(errs, cause)
+	}
+
+	for i := len(k.started) - 1; i >= 0; i-- {
+		m := k.started[i]
+		if sf := k.stopFuncs[m.ID()]; sf != nil {
+			errs = append(errs, sf(stopCtx))
 		}
 	}
 
-	// still notify about the parent context being cancelled
-	if err := ctx.Err(); err != nil {
-		errs = append(errs, err)
+	if k.cancelListener != nil {
+		k.cancelListener()
 	}
 
-	b.tryBuf(e)
 	return errors.Join(errs...)
 }
 
-func (b *Bus) sendEvent(ctx context.Context, e Event, c chan<- Event) error {
-	if b.timeout != 0 {
-		// every event gets its own timeout if specified
-		var cf func()
-		ctx, cf = context.WithTimeout(ctx, b.timeout)
-		defer cf()
-	}
-
-	select {
-	case c <- e:
-		return nil
-	case <-ctx.Done():
-		return ctx.Err()
+func (k *Kernel) handleEvent(e Event) {
+	if msc, ok := e.Payload.(ModuleStatusChanged); ok && msc.To == ModuleStateNOK {
+		k.state.Set(ModuleStateNOK)
+		k.nokModuleID = msc.ID
 	}
 }
 
-func (b *Bus) cloneBuf() []Event {
-	b.mux.RLock()
-	defer b.mux.RUnlock()
-	return slices.Clone(b.buf)
+// RetainContext returns a new context with new [context.CancelFunc].
+func RetainContext(ctx context.Context) (retained context.Context, cancel func()) {
+	retained = context.WithoutCancel(ctx)
+	return context.WithCancel(retained)
 }
 
-func (b *Bus) tryBuf(e Event) {
-	if b.shouldBuf.Load() {
-		b.mux.Lock()
-		defer b.mux.Unlock()
-
-		b.buf = append(b.buf, e)
-	}
+// RetainContextCause returns a new context with new [context.CancelCauseFunc].
+func RetainContextCause(ctx context.Context) (retained context.Context, cancel func(error)) {
+	retained = context.WithoutCancel(ctx)
+	return context.WithCancelCause(retained)
 }

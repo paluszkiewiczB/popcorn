@@ -1,59 +1,56 @@
+// Package attr exposes common slog attributes used by popcorn.
 package attr
 
 import (
-	"fmt"
 	"log/slog"
-	"math/rand"
 	"reflect"
+	"strings"
 )
 
+// Err returns a slog attribute that preserves the full error chain.
 func Err(err error) slog.Attr {
-	return slog.String("err", err.Error())
+	return slog.Any("err", err)
 }
 
+// NamedErr returns a slog attribute with the error under the given key.
 func NamedErr(key string, err error) slog.Attr {
 	if err == nil {
 		return slog.Attr{}
 	}
 
-	return slog.String(key, err.Error())
+	return slog.Any(key, err)
 }
 
-func Strings(key string, strings []string) slog.Attr {
-	return slog.String(key, fmt.Sprintf("%v", strings))
+// Strings returns a slog attribute with the string slice under the given key.
+func Strings(key string, values []string) slog.Attr {
+	return slog.String(key, strings.Join(values, ", "))
 }
 
-func ModId(id string) slog.Attr {
+// ModID returns a slog attribute with the module id under the key "mod".
+func ModID(id string) slog.Attr {
 	return slog.String("mod", id)
 }
 
-func RandomID(key string) slog.Attr {
-	const charset = "abcdefghijklmnopqrstuvwxyzABCDEFGHIJKLMNOPQRSTUVWXYZ0123456789"
-	var id [10]uint8
-	for i := 0; i < 10; i++ {
-		id[i] = charset[rand.Intn(len(charset))]
-	}
-
-	return slog.String(key, string(id[:]))
-}
-
+// TypeOf returns a slog attribute with the fully qualified type name of the value.
 func TypeOf[T any](key string, val T) slog.Attr {
 	return slog.String(key, typeName(val))
 }
 
 func typeName[T any](val T) string {
-	t := reflect.TypeOf(val)
-	if t == nil {
+	v := reflect.ValueOf(val)
+	if !v.IsValid() || (v.Kind() == reflect.Ptr && v.IsNil()) {
 		return "nil"
 	}
 
-	return t.Name()
-}
+	t := v.Type()
+	for t.Kind() == reflect.Ptr {
+		t = t.Elem()
+	}
 
-func Chan[T any](c chan T) slog.Attr {
-	return NamedChan("chan", c)
-}
+	name := t.Name()
+	if pkg := t.PkgPath(); pkg != "" {
+		name = pkg + "." + name
+	}
 
-func NamedChan[T any](key string, c chan T) slog.Attr {
-	return slog.String(key, fmt.Sprintf("%#v", c))
+	return name
 }

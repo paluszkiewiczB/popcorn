@@ -4,9 +4,6 @@ import (
 	"context"
 	"errors"
 	"fmt"
-	"github.com/matryer/is"
-	"github.com/paluszkiewiczB/popcorn"
-	"github.com/paluszkiewiczB/popcorn/plog/attr"
 	"log"
 	"log/slog"
 	"os"
@@ -15,6 +12,10 @@ import (
 	"strings"
 	"syscall"
 	"testing"
+
+	"github.com/matryer/is"
+	"github.com/paluszkiewiczB/popcorn"
+	"github.com/paluszkiewiczB/popcorn/plog/attr"
 )
 
 const (
@@ -30,7 +31,7 @@ func Test_DependentModules(t *testing.T) {
 		ctx, cf := signal.NotifyContext(ctx, syscall.SIGINT, syscall.SIGTERM)
 		defer cf()
 
-		bus, err := popcorn.NewBus(nil)
+		bus, err := popcorn.NewBus()
 		is.NoErr(err)
 
 		var stopModuleA eventCb = func(event popcorn.Event) {
@@ -50,9 +51,7 @@ func Test_DependentModules(t *testing.T) {
 		// missing event should be buffered
 		// and send to module A too
 
-		aStore, aChan := newEventStore(t,
-			stopModuleA.when(payloadMatches(func(started popcorn.ModuleStarted) bool { return started.ID == idA })),
-		)
+		aStore, aChan := newEventStore(t, stopModuleA.when(payloadMatches(func(started popcorn.ModuleStarted) bool { return started.ID == idA })))
 		defer aStore.startStoring(aChan)()
 
 		modA, err := popcorn.NewModule(popcorn.ModRecipe{
@@ -60,9 +59,9 @@ func Test_DependentModules(t *testing.T) {
 			Dependencies: []string{idB},
 			EventsChan:   aChan,
 			Start: func(ctx context.Context) (popcorn.StopFunc, error) {
-				slog.InfoContext(ctx, "module starting", attr.ModId(idA))
+				slog.InfoContext(ctx, "module starting", attr.ModID(idA))
 				return func(ctx context.Context) error {
-					slog.InfoContext(ctx, "module stopping", attr.ModId(idA))
+					slog.InfoContext(ctx, "module stopping", attr.ModID(idA))
 					return nil
 				}, nil
 			},
@@ -79,9 +78,9 @@ func Test_DependentModules(t *testing.T) {
 		is.NoErr(err)
 
 		kernel, err := popcorn.NewKernel(
-			bus,
-			slog.New(slog.NewTextHandler(os.Stderr, &slog.HandlerOptions{Level: slog.LevelDebug})),
-			modA, modB,
+			popcorn.WithBus(bus),
+			popcorn.WithLogger(slog.New(slog.NewTextHandler(os.Stderr, &slog.HandlerOptions{Level: slog.LevelDebug}))),
+			popcorn.WithModules(modA, modB),
 		)
 		is.NoErr(err)
 
@@ -109,8 +108,9 @@ func Test_DependentModules(t *testing.T) {
 	})
 }
 
-func newEventStore(t *testing.T, cbs ...eventCb) (eventStore, chan popcorn.Event) {
-	store := eventStore{
+func newEventStore(t *testing.T, cbs ...eventCb) (store eventStore, events chan popcorn.Event) {
+	t.Helper()
+	store = eventStore{
 		t:         t,
 		callBacks: cbs,
 	}
@@ -178,6 +178,7 @@ func (s *eventStore) startStoring(c <-chan popcorn.Event) func() {
 }
 
 func newIs(t *testing.T) *popIs {
+	t.Helper()
 	return &popIs{I: is.New(t)}
 }
 

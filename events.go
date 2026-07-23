@@ -7,6 +7,8 @@ import (
 	"time"
 )
 
+// Event is an asynchronous message sent over the [Bus].
+// Listeners filter by [Event.Kind] and assert [Event.Payload] to the expected type.
 type Event struct {
 	// Kind should be globally unique to allow listeners distinguish between different Events.
 	Kind string
@@ -20,6 +22,7 @@ type Event struct {
 	Payload any
 }
 
+// LogValue implements [slog.LogValuer].
 func (e Event) LogValue() slog.Value {
 	return slog.StringValue("{Kind:" + e.Kind + ", Source:" + e.Source + ", At:" + strconv.Itoa(int(e.At.UnixNano())) + "}")
 }
@@ -39,15 +42,9 @@ func eventKind[T any]() string {
 	return reflect.TypeOf(t).Name()
 }
 
-// NewEvent creates a BaseEvent and fills its [Event.Payload]
+// NewEvent creates a BaseEvent and fills its [Event.Payload].
 func NewEvent[T any](src string, payload T) Event {
 	e := BaseEvent[T](src)
-	e.Payload = payload
-	return e
-}
-
-func newKernelEvent[T any](payload T) Event {
-	e := BaseEvent[T](EventSourceKernel)
 	e.Payload = payload
 	return e
 }
@@ -56,17 +53,16 @@ func eventAttr(e Event) slog.Attr {
 	return slog.Any("evt", e)
 }
 
-// Those are predefined Event types, which the Kernel knows and listens for.
-type (
-	ModuleStarted struct {
-		ID        string
-		Order     int
-		StartTook time.Duration
-	}
+// ModuleStarted is emitted by the [Kernel] after a [Module] has started successfully.
+type ModuleStarted struct {
+	ID        string
+	Order     int
+	StartTook time.Duration
+}
 
-	ModuleStatusChanged struct {
-		ID       string
-		From, To ModuleState
-		Cause    string
-	}
-)
+// ModuleStatusChanged is emitted by a [Module] when its health state changes.
+type ModuleStatusChanged struct {
+	ID       string
+	From, To ModuleState
+	Cause    string
+}

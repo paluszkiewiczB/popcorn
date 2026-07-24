@@ -22,14 +22,10 @@ type Event struct {
 	Payload any
 }
 
-// LogValue implements [slog.LogValuer].
-func (e Event) LogValue() slog.Value {
-	return slog.StringValue("{Kind:" + e.Kind + ", Source:" + e.Source + ", At:" + strconv.Itoa(int(e.At.UnixNano())) + "}")
-}
-
 // BaseEvent has the [Event.Kind] based on T, and current timestamp.
 func BaseEvent[T any](src string) Event {
 	kind := eventKind[T]()
+
 	return Event{
 		Kind:   kind,
 		Source: src,
@@ -46,11 +42,21 @@ func eventKind[T any]() string {
 func NewEvent[T any](src string, payload T) Event {
 	e := BaseEvent[T](src)
 	e.Payload = payload
+
 	return e
 }
 
-func eventAttr(e Event) slog.Attr {
-	return slog.Any("evt", e)
+// LogValue implements [slog.LogValuer].
+func (e Event) LogValue() slog.Value {
+	return EventLogValue(e)
+}
+
+// EventLogValue returns a log value for the given event.
+func EventLogValue(e Event) slog.Value {
+	return slog.StringValue(
+		"{Kind:" + e.Kind + ", Source:" + e.Source +
+			", At:" + strconv.Itoa(int(e.At.UnixNano())) + "}",
+	)
 }
 
 // ModuleStarted is emitted by the [Kernel] after a [Module] has started successfully.

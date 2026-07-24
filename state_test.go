@@ -1,23 +1,25 @@
-package popcorn
+package popcorn_test
 
 import (
 	"testing"
 
 	"github.com/matryer/is"
+	"github.com/paluszkiewiczB/popcorn"
 )
 
 func TestModuleStateStore(t *testing.T) {
+	t.Parallel()
 	is := is.New(t)
 
-	store := &moduleStateStore{}
-	is.Equal(store.Get(), ModuleStateUnknown)
+	store := &popcorn.ModuleStateStore{}
+	is.Equal(store.Get(), popcorn.ModuleStateUnknown)
 
-	store.Set(ModuleStateOK)
-	is.Equal(store.Get(), ModuleStateOK)
+	store.Set(popcorn.ModuleStateOK)
+	is.Equal(store.Get(), popcorn.ModuleStateOK)
 
-	is.True(store.CAS(ModuleStateOK, ModuleStateNOK))
-	is.Equal(store.Get(), ModuleStateNOK)
+	is.True(store.CAS(popcorn.ModuleStateOK, popcorn.ModuleStateNOK))
+	is.Equal(store.Get(), popcorn.ModuleStateNOK)
 
-	is.True(!store.CAS(ModuleStateOK, ModuleStateTempNOK))
-	is.Equal(store.Get(), ModuleStateNOK)
+	is.True(!store.CAS(popcorn.ModuleStateOK, popcorn.ModuleStateTempNOK))
+	is.Equal(store.Get(), popcorn.ModuleStateNOK)
 }

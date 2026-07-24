@@ -2,6 +2,7 @@ package popcorn
 
 import (
 	"context"
+	"errors"
 	"fmt"
 )
 
@@ -15,6 +16,15 @@ type Module interface {
 	// Start initializes the module and returns a [StopFunc] for cleanup.
 	Start(ctx context.Context) (StopFunc, error)
 }
+
+// ErrModuleIDNotSet is returned when a module has no id set.
+var ErrModuleIDNotSet = errors.New("module id not set")
+
+// ErrModuleIDReserved is returned when a module id is reserved by the kernel.
+var ErrModuleIDReserved = errors.New("module id is reserved by the kernel")
+
+// ErrModuleStartNotSet is returned when a module has no start function.
+var ErrModuleStartNotSet = errors.New("start function not set for module")
 
 // TaskModule is a module that performs finite work and then signals completion.
 // When all [TaskModule]s in a kernel are done, the kernel initiates graceful shutdown.
@@ -65,20 +75,26 @@ func (m *module) Events() chan Event {
 	if m.events == nil {
 		return nil
 	}
+
 	return m.events
 }
 
 // NewModule creates a [Module] from the given [ModRecipe].
+//
+//nolint:ireturn
 func NewModule(recipe ModRecipe) (Module, error) {
 	if recipe.ID == "" {
-		return nil, fmt.Errorf("module id not set")
+		return nil, fmt.Errorf("%w", ErrModuleIDNotSet)
 	}
+
 	if recipe.ID == EventSourceKernel {
-		return nil, fmt.Errorf("module id %q is reserved by the kernel", EventSourceKernel)
+		return nil, fmt.Errorf("%w: %q", ErrModuleIDReserved, EventSourceKernel)
 	}
+
 	if recipe.Start == nil {
-		return nil, fmt.Errorf("start function not set for module %q", recipe.ID)
+		return nil, fmt.Errorf("%w: %q", ErrModuleStartNotSet, recipe.ID)
 	}
+
 	return &module{
 		id:           recipe.ID,
 		dependencies: recipe.Dependencies,

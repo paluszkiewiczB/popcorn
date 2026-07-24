@@ -11,8 +11,15 @@ import (
 	"github.com/paluszkiewiczB/popcorn"
 )
 
+var (
+	errBoom    = errors.New("boom")
+	errCleanup = errors.New("cleanup")
+)
+
 func TestKernel_StartsModulesInDependencyOrder(t *testing.T) {
+	t.Parallel()
 	is := is.New(t)
+
 	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
 	defer cancel()
 
@@ -21,18 +28,18 @@ func TestKernel_StartsModulesInDependencyOrder(t *testing.T) {
 	modA, err := popcorn.NewModule(popcorn.ModRecipe{
 		ID:           "a",
 		Dependencies: []string{"b"},
-		Start: func(ctx context.Context) (popcorn.StopFunc, error) {
+		Start: func(_ context.Context) (popcorn.StopFunc, error) {
 			order = append(order, "a")
-			return nil, nil
+			return func(_ context.Context) error { return nil }, nil
 		},
 	})
 	is.NoErr(err)
 
 	modB, err := popcorn.NewModule(popcorn.ModRecipe{
 		ID: "b",
-		Start: func(ctx context.Context) (popcorn.StopFunc, error) {
+		Start: func(_ context.Context) (popcorn.StopFunc, error) {
 			order = append(order, "b")
-			return nil, nil
+			return func(_ context.Context) error { return nil }, nil
 		},
 	})
 	is.NoErr(err)
@@ -51,13 +58,14 @@ func TestKernel_StartsModulesInDependencyOrder(t *testing.T) {
 }
 
 func TestKernel_CircularDependency(t *testing.T) {
+	t.Parallel()
 	is := is.New(t)
 
 	modA, err := popcorn.NewModule(popcorn.ModRecipe{
 		ID:           "a",
 		Dependencies: []string{"b"},
-		Start: func(ctx context.Context) (popcorn.StopFunc, error) {
-			return nil, nil
+		Start: func(_ context.Context) (popcorn.StopFunc, error) {
+			return func(_ context.Context) error { return nil }, nil
 		},
 	})
 	is.NoErr(err)
@@ -65,8 +73,8 @@ func TestKernel_CircularDependency(t *testing.T) {
 	modB, err := popcorn.NewModule(popcorn.ModRecipe{
 		ID:           "b",
 		Dependencies: []string{"a"},
-		Start: func(ctx context.Context) (popcorn.StopFunc, error) {
-			return nil, nil
+		Start: func(_ context.Context) (popcorn.StopFunc, error) {
+			return func(_ context.Context) error { return nil }, nil
 		},
 	})
 	is.NoErr(err)
@@ -77,13 +85,14 @@ func TestKernel_CircularDependency(t *testing.T) {
 }
 
 func TestKernel_MissingDependency(t *testing.T) {
+	t.Parallel()
 	is := is.New(t)
 
 	modA, err := popcorn.NewModule(popcorn.ModRecipe{
 		ID:           "a",
 		Dependencies: []string{"missing"},
-		Start: func(ctx context.Context) (popcorn.StopFunc, error) {
-			return nil, nil
+		Start: func(_ context.Context) (popcorn.StopFunc, error) {
+			return func(_ context.Context) error { return nil }, nil
 		},
 	})
 	is.NoErr(err)
@@ -94,13 +103,14 @@ func TestKernel_MissingDependency(t *testing.T) {
 }
 
 func TestKernel_StartFailure(t *testing.T) {
+	t.Parallel()
 	is := is.New(t)
 	ctx := context.Background()
 
 	modA, err := popcorn.NewModule(popcorn.ModRecipe{
 		ID: "a",
-		Start: func(ctx context.Context) (popcorn.StopFunc, error) {
-			return nil, errors.New("boom")
+		Start: func(_ context.Context) (popcorn.StopFunc, error) {
+			return nil, errBoom
 		},
 	})
 	is.NoErr(err)
@@ -113,7 +123,9 @@ func TestKernel_StartFailure(t *testing.T) {
 }
 
 func TestKernel_ModuleNOKStopsKernel(t *testing.T) {
+	t.Parallel()
 	is := is.New(t)
+
 	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
 	defer cancel()
 
@@ -122,13 +134,14 @@ func TestKernel_ModuleNOKStopsKernel(t *testing.T) {
 
 	modA, err := popcorn.NewModule(popcorn.ModRecipe{
 		ID: "a",
-		Start: func(ctx context.Context) (popcorn.StopFunc, error) {
+		Start: func(_ context.Context) (popcorn.StopFunc, error) {
 			go func() {
 				_ = bus.Send(ctx, popcorn.NewEvent[popcorn.ModuleStatusChanged]("a", popcorn.ModuleStatusChanged{
 					ID: "a", From: popcorn.ModuleStateOK, To: popcorn.ModuleStateNOK, Cause: "fail",
 				}))
 			}()
-			return nil, nil
+
+			return func(_ context.Context) error { return nil }, nil
 		},
 	})
 	is.NoErr(err)
@@ -137,14 +150,17 @@ func TestKernel_ModuleNOKStopsKernel(t *testing.T) {
 	is.NoErr(err)
 
 	err = kernel.Start(ctx)
-	var unhealthy popcorn.ErrKernelUnhealthy
+
+	var unhealthy popcorn.KernelUnhealthyError
 	is.True(errors.As(err, &unhealthy))
 	is.True(errors.Is(err, unhealthy))
-	is.True(strings.Contains(err.Error(), "module a reported NOK"))
+	is.True(strings.Contains(err.Error(), "module NOK"))
 }
 
 func TestKernel_TaskModuleCompletion(t *testing.T) {
+	t.Parallel()
 	is := is.New(t)
+
 	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
 	defer cancel()
 
@@ -152,11 +168,12 @@ func TestKernel_TaskModuleCompletion(t *testing.T) {
 
 	task := &taskModule{
 		id: "task",
-		start: func(ctx context.Context) (popcorn.StopFunc, error) {
+		start: func(_ context.Context) (popcorn.StopFunc, error) {
 			go func() {
 				close(done)
 			}()
-			return nil, nil
+
+			return func(_ context.Context) error { return nil }, nil
 		},
 		done: done,
 	}
@@ -182,20 +199,21 @@ func (m *taskModule) Start(ctx context.Context) (popcorn.StopFunc, error) {
 func (m *taskModule) Done() <-chan struct{} { return m.done }
 
 func TestKernel_DuplicateModuleID(t *testing.T) {
+	t.Parallel()
 	is := is.New(t)
 
 	modA, err := popcorn.NewModule(popcorn.ModRecipe{
 		ID: "a",
-		Start: func(ctx context.Context) (popcorn.StopFunc, error) {
-			return nil, nil
+		Start: func(_ context.Context) (popcorn.StopFunc, error) {
+			return func(_ context.Context) error { return nil }, nil
 		},
 	})
 	is.NoErr(err)
 
 	modB, err := popcorn.NewModule(popcorn.ModRecipe{
 		ID: "a",
-		Start: func(ctx context.Context) (popcorn.StopFunc, error) {
-			return nil, nil
+		Start: func(_ context.Context) (popcorn.StopFunc, error) {
+			return func(_ context.Context) error { return nil }, nil
 		},
 	})
 	is.NoErr(err)
@@ -205,6 +223,7 @@ func TestKernel_DuplicateModuleID(t *testing.T) {
 }
 
 func TestKernel_NilModule(t *testing.T) {
+	t.Parallel()
 	is := is.New(t)
 
 	_, err := popcorn.NewKernel(popcorn.WithModules(nil))
@@ -212,14 +231,16 @@ func TestKernel_NilModule(t *testing.T) {
 }
 
 func TestKernel_WithHealthTickAndStopTimeout(t *testing.T) {
+	t.Parallel()
 	is := is.New(t)
+
 	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
 	defer cancel()
 
 	mod, err := popcorn.NewModule(popcorn.ModRecipe{
 		ID: "a",
-		Start: func(ctx context.Context) (popcorn.StopFunc, error) {
-			return nil, nil
+		Start: func(_ context.Context) (popcorn.StopFunc, error) {
+			return func(_ context.Context) error { return nil }, nil
 		},
 	})
 	is.NoErr(err)
@@ -241,6 +262,7 @@ func TestKernel_WithHealthTickAndStopTimeout(t *testing.T) {
 }
 
 func TestRetainContext(t *testing.T) {
+	t.Parallel()
 	is := is.New(t)
 	ctx, cancel := context.WithCancel(context.Background())
 	cancel()
@@ -252,19 +274,21 @@ func TestRetainContext(t *testing.T) {
 }
 
 func TestRetainContextCause(t *testing.T) {
+	t.Parallel()
 	is := is.New(t)
 	ctx, cancel := context.WithCancel(context.Background())
 	cancel()
 
 	retained, cancelRetained := popcorn.RetainContextCause(ctx)
-	defer cancelRetained(errors.New("cleanup"))
+	defer cancelRetained(errCleanup)
 
 	is.True(retained.Err() == nil)
 }
 
 func TestErrKernelUnhealthy_Unwrap(t *testing.T) {
+	t.Parallel()
 	is := is.New(t)
-	cause := errors.New("boom")
-	err := popcorn.ErrKernelUnhealthy{Cause: cause}
+	cause := errBoom
+	err := popcorn.KernelUnhealthyError{Cause: cause}
 	is.True(errors.Is(err, cause))
 }

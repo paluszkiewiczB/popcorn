@@ -1,3 +1,4 @@
+// Package main demonstrates how to use the popcorn framework with HTTP and Pinger modules.
 package main
 
 import (
@@ -11,6 +12,15 @@ import (
 	"time"
 
 	"github.com/paluszkiewiczB/popcorn"
+)
+
+const (
+	readTimeout    = 5 * time.Second
+	writeTimeout   = 5 * time.Second
+	idleTimeout    = 60 * time.Second
+	clientTimeout  = 5 * time.Second
+	pingerMaxPings = 5
+	e2eTimeout     = 30 * time.Second
 )
 
 // HTTPModule is a reusable HTTP server module.
@@ -48,27 +58,31 @@ func (m *HTTPModule) ModRecipe() popcorn.ModRecipe {
 			srv := &http.Server{
 				Addr:         listener.Addr().String(),
 				Handler:      m.cfg.Handler,
-				ReadTimeout:  5 * time.Second,
-				WriteTimeout: 5 * time.Second,
-				IdleTimeout:  60 * time.Second,
+				ReadTimeout:  readTimeout,
+				WriteTimeout: writeTimeout,
+				IdleTimeout:  idleTimeout,
 			}
 			if m.cfg.ServerOpt != nil {
 				m.cfg.ServerOpt(srv)
 			}
 
 			done := make(chan error, 1)
+
 			go func() {
 				slog.InfoContext(ctx, "http server starting", slog.String("addr", listener.Addr().String()))
+
 				done <- srv.Serve(listener)
 			}()
 
-			return func(ctx context.Context) error {
+			return func(_ context.Context) error {
 				slog.InfoContext(ctx, "http server stopping", slog.String("addr", listener.Addr().String()))
 				shutdownErr := srv.Shutdown(ctx)
+
 				serveErr := <-done
 				if errors.Is(serveErr, http.ErrServerClosed) {
 					serveErr = nil
 				}
+
 				return errors.Join(shutdownErr, serveErr)
 			}, nil
 		},
@@ -101,7 +115,7 @@ func NewPingerModule(bus *popcorn.Bus, maxPings int, deps ...string) *PingerModu
 		maxPings: maxPings,
 		done:     make(chan struct{}),
 		client: &http.Client{
-			Timeout: 5 * time.Second,
+			Timeout: clientTimeout,
 		},
 	}
 }
@@ -119,15 +133,17 @@ func (m *PingerModule) ModRecipe() popcorn.ModRecipe {
 
 			go func() {
 				defer close(m.done)
+
 				addrs, err := m.waitForAddresses(retainedCtx, evts)
 				if err != nil {
 					slog.ErrorContext(retainedCtx, "failed to wait for addresses", slog.String("err", err.Error()))
 					return
 				}
+
 				m.pingAll(retainedCtx, addrs)
 			}()
 
-			return func(ctx context.Context) error {
+			return func(_ context.Context) error {
 				cancel()
 				return nil
 			}, nil
@@ -144,12 +160,13 @@ func (m *PingerModule) Done() <-chan struct{} {
 // for each dependency and the ModuleStarted event for itself.
 func (m *PingerModule) waitForAddresses(ctx context.Context, evts <-chan popcorn.Event) ([]string, error) {
 	seen := make(map[string]struct{}, len(m.deps))
+
 	var addrs []string
 
 	for len(seen) < len(m.deps) {
 		select {
 		case <-ctx.Done():
-			return nil, ctx.Err()
+			return nil, fmt.Errorf("waiting for addresses: %w", ctx.Err())
 		case evt := <-evts:
 			switch p := evt.Payload.(type) {
 			case HTTPServerListens:
@@ -169,7 +186,7 @@ func (m *PingerModule) waitForAddresses(ctx context.Context, evts <-chan popcorn
 }
 
 func (m *PingerModule) pingAll(ctx context.Context, addrs []string) {
-	for i := 0; i < m.maxPings; i++ {
+	for range m.maxPings {
 		select {
 		case <-ctx.Done():
 			return
@@ -181,6 +198,7 @@ func (m *PingerModule) pingAll(ctx context.Context, addrs []string) {
 				slog.ErrorContext(ctx, "ping failed", slog.String("addr", addr), slog.String("err", err.Error()))
 			}
 		}
+
 		time.Sleep(time.Second)
 	}
 }
@@ -195,14 +213,20 @@ func (m *PingerModule) ping(ctx context.Context, addr string) error {
 	if err != nil {
 		return fmt.Errorf("executing request: %w", err)
 	}
-	defer resp.Body.Close()
+	defer func() { _ = resp.Body.Close() }()
 
 	body, err := io.ReadAll(resp.Body)
 	if err != nil {
 		return fmt.Errorf("reading body: %w", err)
 	}
 
-	slog.InfoContext(ctx, "pinged", slog.String("addr", addr), slog.String("status", resp.Status), slog.String("body", string(body)))
+	slog.InfoContext(
+		ctx, "pinged",
+		slog.String("addr", addr),
+		slog.String("status", resp.Status),
+		slog.String("body", string(body)),
+	)
+
 	return nil
 }
 
@@ -217,13 +241,15 @@ func main() {
 	})
 
 	httpRecipe := httpMod.ModRecipe()
+
 	httpModule, err := popcorn.NewModule(httpRecipe)
 	if err != nil {
 		panic(err)
 	}
 
-	pinger := NewPingerModule(bus, 5, httpRecipe.ID)
+	pinger := NewPingerModule(bus, pingerMaxPings, httpRecipe.ID)
 	pingerRecipe := pinger.ModRecipe()
+
 	pingerModule, err := popcorn.NewModule(pingerRecipe)
 	if err != nil {
 		panic(err)
@@ -238,7 +264,7 @@ func main() {
 		panic(err)
 	}
 
-	ctx, cancel := context.WithTimeout(context.Background(), 30*time.Second)
+	ctx, cancel := context.WithTimeout(context.Background(), e2eTimeout)
 	defer cancel()
 
 	if err := kernel.Start(ctx); err != nil {
@@ -246,21 +272,9 @@ func main() {
 	}
 }
 
+//nolint:gosec
 func echoHandler() http.HandlerFunc {
 	return func(w http.ResponseWriter, r *http.Request) {
-		_, _ = w.Write([]byte(r.Host))
+		_, _ = fmt.Fprint(w, r.Host)
 	}
-}
-
-// must panics if err is non-nil.
-func must(err error) {
-	if err != nil {
-		panic(err)
-	}
-}
-
-// must2 panics if err is non-nil, otherwise returns val.
-func must2[T any](val T, err error) T {
-	must(err)
-	return val
 }

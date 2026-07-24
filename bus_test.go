@@ -11,6 +11,7 @@ import (
 )
 
 func TestBus_Send_DeliversToAllListeners(t *testing.T) {
+	t.Parallel()
 	is := is.New(t)
 	ctx := context.Background()
 
@@ -31,6 +32,7 @@ func TestBus_Send_DeliversToAllListeners(t *testing.T) {
 }
 
 func TestBus_Send_Timeout(t *testing.T) {
+	t.Parallel()
 	is := is.New(t)
 	ctx := context.Background()
 
@@ -45,6 +47,7 @@ func TestBus_Send_Timeout(t *testing.T) {
 }
 
 func TestBus_Subscribe_DuplicateID(t *testing.T) {
+	t.Parallel()
 	is := is.New(t)
 	bus, err := popcorn.NewBus()
 	is.NoErr(err)
@@ -55,6 +58,7 @@ func TestBus_Subscribe_DuplicateID(t *testing.T) {
 }
 
 func TestBus_Subscribe_EmptyID(t *testing.T) {
+	t.Parallel()
 	is := is.New(t)
 	bus, err := popcorn.NewBus()
 	is.NoErr(err)
@@ -64,13 +68,16 @@ func TestBus_Subscribe_EmptyID(t *testing.T) {
 }
 
 func TestBus_NilBus(t *testing.T) {
+	t.Parallel()
 	is := is.New(t)
+
 	var bus *popcorn.Bus
 	is.NoErr(bus.Send(context.Background(), popcorn.NewEvent[string]("test", "hello")))
 	bus.Unsubscribe("a")
 }
 
 func TestBus_Buffer(t *testing.T) {
+	t.Parallel()
 	is := is.New(t)
 	ctx := context.Background()
 
@@ -78,6 +85,7 @@ func TestBus_Buffer(t *testing.T) {
 	is.NoErr(err)
 
 	bus.SetBuffering(true)
+
 	evt := popcorn.NewEvent[string]("test", "hello")
 	is.NoErr(bus.Send(ctx, evt))
 
@@ -90,6 +98,7 @@ func TestBus_Buffer(t *testing.T) {
 }
 
 func TestBus_WithBusLogger(t *testing.T) {
+	t.Parallel()
 	is := is.New(t)
 
 	bus, err := popcorn.NewBus(popcorn.WithBusLogger(slog.Default()))
@@ -98,6 +107,7 @@ func TestBus_WithBusLogger(t *testing.T) {
 }
 
 func TestBus_WithSendTimeout(t *testing.T) {
+	t.Parallel()
 	is := is.New(t)
 
 	bus, err := popcorn.NewBus(popcorn.WithSendTimeout(2 * time.Second))

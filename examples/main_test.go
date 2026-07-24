@@ -1,14 +1,15 @@
 package main
 
+// CR: what the fuck are those examples supposed to show?
+
 import (
 	"testing"
 
 	"github.com/matryer/is"
 )
 
-//CR: what the fuck are those examples supposed to show?
-
 func TestHTTPModule(t *testing.T) {
+	t.Parallel()
 	is := is.New(t)
 	mod := NewHTTPModule(HTTPConfig{
 		Handler: echoHandler(),
@@ -21,6 +22,7 @@ func TestHTTPModule(t *testing.T) {
 }
 
 func TestPingerModule(t *testing.T) {
+	t.Parallel()
 	is := is.New(t)
 	mod := NewPingerModule(nil, 3, "dep")
 	is.True(mod != nil)

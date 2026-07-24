@@ -43,17 +43,17 @@ tasks:
     cmds:
       - go mod download
 
-  fmt:
-    desc: "Format code with gofumpt"
+  fix:
+    desc: "Apply auto-fixes from linters and formatters"
     deps: [tools]
     cmds:
-      - "{{.TOOL_BIN}}/gofumpt -extra -l -w ."
+      - "{{.TOOL_BIN}}/golangci-lint run --fix ./..."
+      - "go fix ./..."
 
   lint:
     desc: "Run linters"
     deps: [tools]
     cmds:
-      - '{{.TOOL_BIN}}/gofumpt -extra -l -e . | xargs --no-run-if-empty sh -c "echo ''code is not gofumpt-ed, run task fmt''; exit 1"'
       - "{{.TOOL_BIN}}/golangci-lint run ./..."
 
   tools:

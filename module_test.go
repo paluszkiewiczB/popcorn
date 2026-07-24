@@ -8,54 +8,61 @@ import (
 	"github.com/paluszkiewiczB/popcorn"
 )
 
+const testModuleID = "test"
+
 func TestNewModule_Valid(t *testing.T) {
+	t.Parallel()
 	is := is.New(t)
 	m, err := popcorn.NewModule(popcorn.ModRecipe{
-		ID: "test",
-		Start: func(ctx context.Context) (popcorn.StopFunc, error) {
-			return nil, nil
+		ID: testModuleID,
+		Start: func(_ context.Context) (popcorn.StopFunc, error) {
+			return func(_ context.Context) error { return nil }, nil
 		},
 	})
 	is.NoErr(err)
-	is.Equal(m.ID(), "test")
+	is.Equal(m.ID(), testModuleID)
 	is.Equal(m.Dependencies(), []string(nil))
 }
 
 func TestNewModule_EmptyID(t *testing.T) {
+	t.Parallel()
 	is := is.New(t)
 	_, err := popcorn.NewModule(popcorn.ModRecipe{
 		ID: "",
-		Start: func(ctx context.Context) (popcorn.StopFunc, error) {
-			return nil, nil
+		Start: func(_ context.Context) (popcorn.StopFunc, error) {
+			return func(_ context.Context) error { return nil }, nil
 		},
 	})
 	is.True(err != nil)
 }
 
 func TestNewModule_ReservedID(t *testing.T) {
+	t.Parallel()
 	is := is.New(t)
 	_, err := popcorn.NewModule(popcorn.ModRecipe{
 		ID: popcorn.EventSourceKernel,
-		Start: func(ctx context.Context) (popcorn.StopFunc, error) {
-			return nil, nil
+		Start: func(_ context.Context) (popcorn.StopFunc, error) {
+			return func(_ context.Context) error { return nil }, nil
 		},
 	})
 	is.True(err != nil)
 }
 
 func TestNewModule_NilStart(t *testing.T) {
+	t.Parallel()
 	is := is.New(t)
-	_, err := popcorn.NewModule(popcorn.ModRecipe{ID: "test"})
+	_, err := popcorn.NewModule(popcorn.ModRecipe{ID: testModuleID})
 	is.True(err != nil)
 }
 
 func TestNewModule_WithDependencies(t *testing.T) {
+	t.Parallel()
 	is := is.New(t)
 	m, err := popcorn.NewModule(popcorn.ModRecipe{
-		ID:           "test",
+		ID:           testModuleID,
 		Dependencies: []string{"dep1", "dep2"},
-		Start: func(ctx context.Context) (popcorn.StopFunc, error) {
-			return nil, nil
+		Start: func(_ context.Context) (popcorn.StopFunc, error) {
+			return func(_ context.Context) error { return nil }, nil
 		},
 	})
 	is.NoErr(err)
@@ -63,13 +70,14 @@ func TestNewModule_WithDependencies(t *testing.T) {
 }
 
 func TestNewModule_EventReceiver(t *testing.T) {
+	t.Parallel()
 	is := is.New(t)
 	ch := make(chan popcorn.Event, 1)
 	m, err := popcorn.NewModule(popcorn.ModRecipe{
-		ID:         "test",
+		ID:         testModuleID,
 		EventsChan: ch,
-		Start: func(ctx context.Context) (popcorn.StopFunc, error) {
-			return nil, nil
+		Start: func(_ context.Context) (popcorn.StopFunc, error) {
+			return func(_ context.Context) error { return nil }, nil
 		},
 	})
 	is.NoErr(err)

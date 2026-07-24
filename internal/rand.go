@@ -12,8 +12,9 @@ func RandomID() string {
 	var b [8]byte
 	if _, err := rand.Read(b[:]); err != nil {
 		// crypto/rand should never fail in practice; fall back to zeros
+		// CR: it does not fallback to zeros...
 		return fmt.Sprintf("rand-fail-%v", err)
-		//CR: it does not fallback to zeros...
 	}
+
 	return base64.RawURLEncoding.EncodeToString(b[:])
 }

@@ -1,19 +1,30 @@
 package popcorn
 
+// CR: shouldn't it accept `plog.Logger`?
+
 import (
 	"context"
 	"errors"
 	"fmt"
 	"log/slog"
+	"maps"
 	"slices"
 	"sync"
 	"sync/atomic"
 	"time"
 
-	"github.com/paluszkiewiczB/popcorn/internal"
 	"github.com/paluszkiewiczB/popcorn/plog"
 	"github.com/paluszkiewiczB/popcorn/plog/attr"
 )
+
+// ErrEmptyID is returned when trying to subscribe with an empty id.
+var ErrEmptyID = errors.New("listener id is empty")
+
+// ErrNilChannel is returned when trying to subscribe with a nil channel.
+var ErrNilChannel = errors.New("listener channel is nil")
+
+// ErrDuplicateID is returned when trying to subscribe with an already-registered id.
+var ErrDuplicateID = errors.New("listener already registered")
 
 // Bus is an in-process event bus that delivers events to registered listeners.
 type Bus struct {
@@ -43,8 +54,6 @@ func WithSendTimeout(d time.Duration) BusOption {
 	}
 }
 
-//CR: shouldn't it accept `plog.Logger`?
-
 // WithBusLogger sets the logger used by the bus.
 func WithBusLogger(l *slog.Logger) BusOption {
 	return func(c *busConfig) error {
@@ -64,127 +73,118 @@ func NewBus(opts ...BusOption) (*Bus, error) {
 			return nil, fmt.Errorf("applying bus option: %w", err)
 		}
 	}
+
 	return &Bus{
+		mu:        sync.RWMutex{},
 		listeners: make(map[string]chan<- Event),
 		timeout:   cfg.timeout,
 		log:       cfg.log,
+		shouldBuf: atomic.Bool{},
+		bufMu:     sync.Mutex{},
+		buf:       nil,
 	}, nil
 }
 
-// Subscribe registers a listener channel under the given ID.
-// Returns an error if the ID is empty or already registered.
+// Subscribe registers a channel to receive events for the given id.
 func (b *Bus) Subscribe(id string, ch chan<- Event) error {
-	if b == nil {
-		return nil
-	}
 	if id == "" {
-		return fmt.Errorf("listener id is empty")
+		return ErrEmptyID
 	}
+
 	if ch == nil {
-		return fmt.Errorf("listener channel is nil")
+		return ErrNilChannel
 	}
+
 	b.mu.Lock()
 	defer b.mu.Unlock()
+
 	if _, ok := b.listeners[id]; ok {
-		return fmt.Errorf("listener %q already registered", id)
+		return ErrDuplicateID
 	}
+
 	b.listeners[id] = ch
+
 	return nil
 }
 
-// Unsubscribe removes the listener with the given ID.
+// Unsubscribe removes the listener with the given id.
 func (b *Bus) Unsubscribe(id string) {
 	if b == nil {
 		return
 	}
 	b.mu.Lock()
 	defer b.mu.Unlock()
+
 	delete(b.listeners, id)
 }
 
-// SetBuffering enables or disables synchronous buffering of events.
-// While buffering is enabled, every sent event is appended to the internal buffer
-// before being delivered to listeners.
+// SetBuffering enables or disables event buffering.
 func (b *Bus) SetBuffering(v bool) {
-	if b == nil {
-		return
-	}
 	b.shouldBuf.Store(v)
 }
 
-// Buffer returns a copy of the currently buffered events.
+// Buffer returns all buffered events.
 func (b *Bus) Buffer() []Event {
-	if b == nil {
-		return nil
-	}
 	b.bufMu.Lock()
 	defer b.bufMu.Unlock()
+
 	return slices.Clone(b.buf)
 }
 
-// ClearBuffer removes all buffered events.
+// ClearBuffer clears all buffered events.
 func (b *Bus) ClearBuffer() {
-	if b == nil {
-		return
-	}
 	b.bufMu.Lock()
 	defer b.bufMu.Unlock()
+
 	b.buf = nil
 }
 
-// Send delivers the event to all registered listeners.
+// Send sends an event to all registered listeners.
 func (b *Bus) Send(ctx context.Context, e Event) error {
 	if b == nil {
 		return nil
 	}
-
 	if b.shouldBuf.Load() {
 		b.bufMu.Lock()
 		b.buf = append(b.buf, e)
 		b.bufMu.Unlock()
 	}
 
-	l := b.log.With(slog.String("eid", internal.RandomID()))
-	l.LogAttrs(ctx, slog.LevelInfo, "sending event", eventAttr(e))
-
 	noCancelCtx := context.WithoutCancel(ctx)
+
 	sendCtx, cancel := context.WithTimeout(noCancelCtx, b.timeout)
 	defer cancel()
 
 	b.mu.RLock()
-	//CR: isn't it maps.Copy ?
+	// CR: isn't it maps.Copy ?
 	listeners := make(map[string]chan<- Event, len(b.listeners))
-	for id, ch := range b.listeners {
-		listeners[id] = ch
-	}
+	maps.Copy(listeners, b.listeners)
 	b.mu.RUnlock()
 
-	var errs []error
+	b.log.LogAttrs(
+		ctx, slog.LevelDebug, "sending event",
+		slog.String("kind", e.Kind), attr.ModID(e.Source),
+		slog.Int("listeners", len(listeners)),
+	)
+
 	for id, ch := range listeners {
-		l.LogAttrs(ctx, slog.LevelDebug, "sending event to listener", attr.ModID(id))
 		if err := b.sendEvent(sendCtx, e, ch); err != nil {
-			errs = append(errs, fmt.Errorf("sending event to %s: %w", id, err))
+			b.log.LogAttrs(ctx, slog.LevelWarn, "failed to send event", attr.ModID(id), attr.Err(err))
 		}
 	}
 
-	if err := ctx.Err(); err != nil {
-		errs = append(errs, err)
+	if err := sendCtx.Err(); err != nil {
+		return fmt.Errorf("send timeout: %w", err)
 	}
 
-	return errors.Join(errs...)
+	return nil
 }
 
 func (b *Bus) sendEvent(ctx context.Context, e Event, ch chan<- Event) error {
-	if b.timeout != 0 {
-		var cancel func()
-		ctx, cancel = context.WithTimeout(ctx, b.timeout)
-		defer cancel()
-	}
-
 	select {
+	case <-ctx.Done():
+		return fmt.Errorf("send failed: %w", ctx.Err())
 	case ch <- e:
 		return nil
-	case <-ctx.Done():
-		return ctx.Err()
 	}
 }

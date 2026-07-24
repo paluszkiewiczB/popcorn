@@ -38,12 +38,12 @@ func TypeOf[T any](key string, val T) slog.Attr {
 
 func typeName[T any](val T) string {
 	v := reflect.ValueOf(val)
-	if !v.IsValid() || (v.Kind() == reflect.Ptr && v.IsNil()) {
+	if !v.IsValid() || (v.Kind() == reflect.Pointer && v.IsNil()) {
 		return "nil"
 	}
 
 	t := v.Type()
-	for t.Kind() == reflect.Ptr {
+	for t.Kind() == reflect.Pointer {
 		t = t.Elem()
 	}
 

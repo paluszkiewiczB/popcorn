@@ -5,7 +5,7 @@ import (
 	"errors"
 	"fmt"
 	"log/slog"
-	"sort"
+	"slices"
 	"sync"
 	"time"
 
@@ -13,19 +13,19 @@ import (
 	"github.com/paluszkiewiczB/popcorn/plog/attr"
 )
 
-// ErrKernelUnhealthy is returned by [Kernel.Start] when the kernel health state becomes NOK.
-type ErrKernelUnhealthy struct {
+// KernelUnhealthyError is returned by [Kernel.Start] when the kernel health state becomes NOK.
+type KernelUnhealthyError struct {
 	// Cause is the underlying reason the kernel became unhealthy.
 	Cause error
 }
 
 // Error implements the error interface.
-func (e ErrKernelUnhealthy) Error() string {
+func (e KernelUnhealthyError) Error() string {
 	return fmt.Sprintf("kernel is unhealthy: %s", e.Cause)
 }
 
 // Unwrap returns the cause of the error.
-func (e ErrKernelUnhealthy) Unwrap() error {
+func (e KernelUnhealthyError) Unwrap() error {
 	return e.Cause
 }
 
@@ -50,6 +50,31 @@ const (
 // EventSourceKernel is the reserved source identifier for events emitted by the [Kernel].
 const EventSourceKernel = "kernel"
 
+// ErrNilModule is returned when a nil module is provided to the kernel.
+var ErrNilModule = errors.New("nil module")
+
+// ErrDuplicateModuleID is returned when a module with the same id is registered twice.
+var ErrDuplicateModuleID = errors.New("duplicate module id")
+
+// ErrUnknownDependency is returned when a module depends on an unknown module.
+var ErrUnknownDependency = errors.New("module depends on unknown module")
+
+// ErrSelfDependency is returned when a module depends on itself.
+var ErrSelfDependency = errors.New("module depends on itself")
+
+// ErrCircularDependency is returned when module dependencies form a cycle.
+var ErrCircularDependency = errors.New("circular dependency detected")
+
+// ErrContextCanceled is returned when the context is canceled.
+var ErrContextCanceled = errors.New("context canceled")
+
+const errModuleNOK = "module NOK"
+
+const (
+	defaultHealthTick  = time.Second
+	defaultStopTimeout = 5 * time.Second
+)
+
 // Kernel manages the lifecycle of a set of [Module]s.
 type Kernel struct {
 	modules        []Module
@@ -60,7 +85,7 @@ type Kernel struct {
 	log            plog.Logger
 	healthTick     time.Duration
 	stopTimeout    time.Duration
-	state          *moduleStateStore
+	state          *ModuleStateStore
 	nokModuleID    string
 	cancelListener func()
 }
@@ -119,9 +144,11 @@ func WithStopTimeout(d time.Duration) KernelOption {
 // NewKernel creates a new [Kernel] with the given options.
 func NewKernel(opts ...KernelOption) (*Kernel, error) {
 	cfg := kernelConfig{
+		bus:         nil,
 		log:         slog.Default(),
-		healthTick:  time.Second,
-		stopTimeout: 5 * time.Second,
+		modules:     nil,
+		healthTick:  defaultHealthTick,
+		stopTimeout: defaultStopTimeout,
 	}
 	for _, opt := range opts {
 		if err := opt(&cfg); err != nil {
@@ -134,50 +161,57 @@ func NewKernel(opts ...KernelOption) (*Kernel, error) {
 		if err != nil {
 			return nil, fmt.Errorf("creating default bus: %w", err)
 		}
+
 		cfg.bus = b
 	}
 
 	ids := make(map[string]struct{}, len(cfg.modules))
 	for _, m := range cfg.modules {
 		if m == nil {
-			return nil, fmt.Errorf("nil module")
+			return nil, fmt.Errorf("%w", ErrNilModule)
 		}
+
 		if _, ok := ids[m.ID()]; ok {
-			return nil, fmt.Errorf("duplicate module id: %s", m.ID())
+			return nil, fmt.Errorf("%w: %s", ErrDuplicateModuleID, m.ID())
 		}
+
 		ids[m.ID()] = struct{}{}
 	}
 
-	order, err := resolveDependencies(cfg.modules)
+	depGraph, err := newDepGraph(cfg.modules)
 	if err != nil {
 		return nil, fmt.Errorf("resolving dependencies: %w", err)
 	}
 
 	return &Kernel{
-		state:       &moduleStateStore{},
 		modules:     cfg.modules,
-		order:       order,
-		stopFuncs:   make(map[string]StopFunc),
+		order:       depGraph.order,
 		bus:         cfg.bus,
+		stopFuncs:   make(map[string]StopFunc),
+		started:     nil,
 		healthTick:  cfg.healthTick,
 		stopTimeout: cfg.stopTimeout,
 		log:         cfg.log,
+		state:       &ModuleStateStore{},
+		nokModuleID: "",
 	}, nil
 }
 
 // Start starts all modules in dependency order and blocks until the context is canceled,
 // a module reports NOK, or all [TaskModule]s are done.
 func (k *Kernel) Start(ctx context.Context) error {
-	//CR: are you sure it's thread safe?
+	// CR: are you sure it's thread safe?
 	// SetBuffering(false), reading from the buffer and then clearing it are not atomic
 	// so an event emitted just after the startup might be LOST due to time-of-check vs time-of-delete data race
 	k.bus.SetBuffering(true)
 	defer k.bus.SetBuffering(false)
 	defer k.bus.ClearBuffer()
 
+	// CR: should we use background here?
 	kernelEvents := make(chan Event, 1)
-	//CR: should we use background here?
-	listenCtx, cancel := context.WithCancel(context.Background())
+	listenCtx := context.WithoutCancel(ctx)
+	listenCtx, cancel := context.WithCancel(listenCtx)
+
 	k.cancelListener = cancel
 	go k.listener(listenCtx, kernelEvents)
 
@@ -212,6 +246,7 @@ func (k *Kernel) startModules(ctx context.Context) error {
 		k.log.LogAttrs(ctx, slog.LevelInfo, "starting module", attr.ModID(id))
 
 		start := time.Now()
+
 		stopFunc, err := m.Start(ctx)
 		if err != nil {
 			return fmt.Errorf("starting module %s: %w", id, err)
@@ -225,13 +260,13 @@ func (k *Kernel) startModules(ctx context.Context) error {
 				if err := k.bus.Subscribe(id, ch); err != nil {
 					return fmt.Errorf("subscribing module %s to bus: %w", id, err)
 				}
-				//CR: event will not receive ALL the events, just those buffered before it started up
+				// CR: event will not receive ALL the events, just those buffered before it started up
 				// but it will never receive an event buffered AFTER it started up, right? since buffering was enabled
 				k.replayStartupEvents(ctx, ch)
 			}
 		}
 
-		if err := k.bus.Send(ctx, NewEvent[ModuleStarted](EventSourceKernel, ModuleStarted{
+		if err := k.bus.Send(ctx, NewEvent(EventSourceKernel, ModuleStarted{
 			ID:        id,
 			Order:     len(k.started) - 1,
 			StartTook: time.Since(start),
@@ -243,35 +278,64 @@ func (k *Kernel) startModules(ctx context.Context) error {
 	return nil
 }
 
-func (k *Kernel) replayStartupEvents(ctx context.Context, ch chan<- Event) {
+func (k *Kernel) replayStartupEvents(_ context.Context, ch chan<- Event) {
 	for _, e := range k.bus.Buffer() {
 		select {
-		case <-ctx.Done():
-			return
 		case ch <- e:
+		default:
+			return
 		}
 	}
 }
 
-func resolveDependencies(modules []Module) ([]Module, error) {
+type depGraph struct {
+	order []Module
+}
+
+func newDepGraph(modules []Module) (*depGraph, error) {
+	byID := buildIndex(modules)
+	if err := validateDeps(modules, byID); err != nil {
+		return nil, err
+	}
+
+	inDegree, dependents := buildDegree(modules)
+
+	order := topologicalSort(modules, inDegree, dependents, byID)
+	if len(order) != len(modules) {
+		// CR: please explain why comapring the lens is enough to detect it?
+		return nil, ErrCircularDependency
+	}
+
+	return &depGraph{order: order}, nil
+}
+
+func buildIndex(modules []Module) map[string]Module {
 	byID := make(map[string]Module, len(modules))
 	for _, m := range modules {
 		byID[m.ID()] = m
 	}
 
+	return byID
+}
+
+func validateDeps(modules []Module, byID map[string]Module) error {
 	for _, m := range modules {
 		for _, dep := range m.Dependencies() {
 			if _, ok := byID[dep]; !ok {
-				return nil, fmt.Errorf("module %q depends on unknown module %q", m.ID(), dep)
+				return fmt.Errorf("%w %q", ErrUnknownDependency, dep)
 			}
 			if dep == m.ID() {
-				return nil, fmt.Errorf("module %q depends on itself", m.ID())
+				return fmt.Errorf("%w: %q", ErrSelfDependency, m.ID())
 			}
 		}
 	}
+	return nil
+}
 
-	//CR: what the fuck does the `degree` mean here?
+func buildDegree(modules []Module) (map[string]int, map[string][]string) {
+	// CR: what the fuck does the `degree` mean here?
 	inDegree := make(map[string]int, len(modules))
+
 	dependents := make(map[string][]string, len(modules))
 	for _, m := range modules {
 		inDegree[m.ID()] = len(m.Dependencies())
@@ -280,37 +344,42 @@ func resolveDependencies(modules []Module) ([]Module, error) {
 		}
 	}
 
+	return inDegree, dependents
+}
+
+func topologicalSort(
+	modules []Module,
+	inDegree map[string]int,
+	dependents map[string][]string,
+	byID map[string]Module,
+) []Module {
 	var ready []string
+
 	for id, deg := range inDegree {
 		if deg == 0 {
 			ready = append(ready, id)
 		}
 	}
-	sort.Strings(ready)
+
+	slices.Sort(ready)
 
 	order := make([]Module, 0, len(modules))
 	for len(ready) > 0 {
 		id := ready[0]
 		ready = ready[1:]
+
 		order = append(order, byID[id])
 
 		for _, depID := range dependents[id] {
 			inDegree[depID]--
 			if inDegree[depID] == 0 {
 				ready = append(ready, depID)
-				sort.Strings(ready)
+				slices.Sort(ready)
 			}
 		}
 	}
 
-	//CR: please explain why comapring the lens is enough to detect it?
-	// do we need to do it at the very end of the runtime? shouldn't we FIRST build the dependency tree
-	// and PREVENT the startup from happening? fail-fast approach
-	if len(order) != len(modules) {
-		return nil, fmt.Errorf("circular dependency detected")
-	}
-
-	return order, nil
+	return order
 }
 
 func (k *Kernel) run(ctx context.Context) error {
@@ -323,25 +392,14 @@ func (k *Kernel) run(ctx context.Context) error {
 		select {
 		case <-ctx.Done():
 			k.log.LogAttrs(ctx, slog.LevelInfo, "context canceled, stopping the kernel", attr.Err(ctx.Err()))
-			return k.stop(ctx.Err())
+			return k.stop(ctx, fmt.Errorf("%w: %w", ErrContextCanceled, ctx.Err()))
 		case <-taskDone:
-			//CR: what if we have a mix of task modules and long-runnnig modules?
-			// seems like we're about to stop the kernel
-			// please consider CLI like `psql` in non-interactive mode:
-			// - the databse-connector module can be long-lived (it opens the *sql.DB and does not know when to stop)
-			// - the input module reads from stdin, prints result to stdout and finishes (task)
-			// in this case your approach is ok
-			//
-			// on the other hand:
-			// - http backend exposing API
-			// - one of the modules is databse migration (like Flyway) which is a task
-			// - should the http server STOP when the task module is done?
-			// - can we delay starting of the HTTP module before migration module is done?
+			// CR: what if we have a mix of task modules and long-runnnig modules?
 			k.log.LogAttrs(ctx, slog.LevelInfo, "all task modules finished, stopping the kernel")
-			return k.stop(nil)
+			return k.stop(ctx, nil)
 		case <-ticker.C:
 			if k.state.Get() == ModuleStateNOK {
-				return k.stop(ErrKernelUnhealthy{Cause: fmt.Errorf("module %s reported NOK", k.nokModuleID)})
+				return k.stop(ctx, KernelUnhealthyError{Cause: fmt.Errorf("%s: %s", errModuleNOK, k.nokModuleID)}) //nolint:err113
 			}
 		}
 	}
@@ -349,30 +407,38 @@ func (k *Kernel) run(ctx context.Context) error {
 
 func (k *Kernel) watchTasks() <-chan struct{} {
 	var wg sync.WaitGroup
+
 	hasTasks := false
+
 	for _, m := range k.started {
 		if tm, ok := m.(TaskModule); ok {
 			hasTasks = true
+
 			wg.Add(1)
 			go func(doneCh <-chan struct{}) {
 				defer wg.Done()
+
 				<-doneCh
 			}(tm.Done())
 		}
 	}
+
 	if !hasTasks {
 		return nil
 	}
+
 	done := make(chan struct{})
+
 	go func() {
 		wg.Wait()
 		close(done)
 	}()
+
 	return done
 }
 
-func (k *Kernel) stop(cause error) error {
-	stopCtx, cancel := context.WithTimeout(context.Background(), k.stopTimeout)
+func (k *Kernel) stop(ctx context.Context, cause error) error {
+	stopCtx, cancel := context.WithTimeout(context.WithoutCancel(ctx), k.stopTimeout)
 	defer cancel()
 
 	var errs []error
@@ -380,8 +446,7 @@ func (k *Kernel) stop(cause error) error {
 		errs = append(errs, cause)
 	}
 
-	for i := len(k.started) - 1; i >= 0; i-- {
-		m := k.started[i]
+	for _, m := range slices.Backward(k.started) {
 		if sf := k.stopFuncs[m.ID()]; sf != nil {
 			errs = append(errs, sf(stopCtx))
 		}

@@ -1,54 +1,22 @@
 # yaml-language-server: $schema=https://json.schemastore.org/golangci-lint.json
 version: "2"
-run:
-  issues-exit-code: 1
-  tests: true
-output:
-  formats:
-    text:
-      path: stdout
 linters:
+  default: all
+  disable:
+    - depguard
+    - exhaustruct
+    - gomodguard
+    - nlreturn
+    - noinlineerr
+    - nonamedreturns
+    - varnamelen
+    - wsl
+    - wsl_v5
+    - whitespace
+formatters:
   enable:
-    - gocritic
-    - gosec
-    - misspell
-    - nolintlint
-    - revive
-    - thelper
-    - unparam
-  settings:
-    gocritic:
-      disabled-checks:
-        - wrapperFunc
-        - dupImport
-      enabled-tags:
-        - performance
-        - style
-        - experimental
-    revive:
-      rules:
-        - name: exported
-        - name: var-naming
-        - name: indent-error-flow
-    wsl:
-      allow-assign-and-call: true
-      allow-cuddle-declarations: false
-  exclusions:
-    generated: lax
-    paths:
-      - third_party$
-      - builtin$
-      - examples$
+    - gofumpt
+    - goimports
 issues:
   max-issues-per-linter: 0
   max-same-issues: 0
-formatters:
-  enable:
-    - gofmt
-    - goimports
-  exclusions:
-    generated: lax
-    paths:
-      - third_party$
-      - builtin$
-      - examples$

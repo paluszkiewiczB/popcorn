@@ -6,7 +6,7 @@ import (
 	"log/slog"
 )
 
-// ensure compatibility
+// ensure compatibility.
 var _ Logger = (*slog.Logger)(nil)
 
 // Logger is a narrowed-down version of slog.Logger.

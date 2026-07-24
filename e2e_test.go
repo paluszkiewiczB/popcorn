@@ -3,7 +3,6 @@ package popcorn_test
 import (
 	"context"
 	"errors"
-	"fmt"
 	"log"
 	"log/slog"
 	"os"
@@ -25,87 +24,96 @@ const (
 )
 
 func Test_DependentModules(t *testing.T) {
+	t.Parallel()
 	t.Run("module b should be started before module a, because it has a dependency", func(t *testing.T) {
-		is := newIs(t)
-		ctx := context.Background()
-		ctx, cf := signal.NotifyContext(ctx, syscall.SIGINT, syscall.SIGTERM)
-		defer cf()
-
-		bus, err := popcorn.NewBus()
-		is.NoErr(err)
-
-		var stopModuleA eventCb = func(event popcorn.Event) {
-			err := bus.Send(ctx, popcorn.NewEvent[popcorn.ModuleStatusChanged](idA, popcorn.ModuleStatusChanged{
-				ID:    idA,
-				From:  popcorn.ModuleStateOK,
-				To:    popcorn.ModuleStateNOK,
-				Cause: "the other module has started",
-			}))
-
-			// FIXME: should I get the context.Canceled error here?
-			is.NoCtxErr(err)
-		}
-
-		// even though module A starts as the second one
-		// and will not be notified about module B being started,
-		// missing event should be buffered
-		// and send to module A too
-
-		aStore, aChan := newEventStore(t, stopModuleA.when(payloadMatches(func(started popcorn.ModuleStarted) bool { return started.ID == idA })))
-		defer aStore.startStoring(aChan)()
-
-		modA, err := popcorn.NewModule(popcorn.ModRecipe{
-			ID:           idA,
-			Dependencies: []string{idB},
-			EventsChan:   aChan,
-			Start: func(ctx context.Context) (popcorn.StopFunc, error) {
-				slog.InfoContext(ctx, "module starting", attr.ModID(idA))
-				return func(ctx context.Context) error {
-					slog.InfoContext(ctx, "module stopping", attr.ModID(idA))
-					return nil
-				}, nil
-			},
-		})
-		is.NoErr(err)
-
-		modB, err := popcorn.NewModule(popcorn.ModRecipe{
-			ID: idB,
-			Start: func(ctx context.Context) (popcorn.StopFunc, error) {
-				log.Printf("module b starting")
-				return nil, nil
-			},
-		})
-		is.NoErr(err)
-
-		kernel, err := popcorn.NewKernel(
-			popcorn.WithBus(bus),
-			popcorn.WithLogger(slog.New(slog.NewTextHandler(os.Stderr, &slog.HandlerOptions{Level: slog.LevelDebug}))),
-			popcorn.WithModules(modA, modB),
-		)
-		is.NoErr(err)
-
-		err = kernel.Start(ctx)
-
-		// kernel should stop due to module A being unhealthy
-		unhealthy := popcorn.ErrKernelUnhealthy{}
-		if !errors.As(err, &unhealthy) {
-			is.NoErr(err)
-		}
-
-		is.True(strings.Contains(unhealthy.Error(), idA))
-
-		is.Equal(len(aStore.evts), 2)
-		is.True(payloadMatches[popcorn.ModuleStarted](
-			func(started popcorn.ModuleStarted) bool {
-				return started.ID == idB
-			},
-		)(aStore.evts[0]))
-		is.True(payloadMatches[popcorn.ModuleStarted](
-			func(started popcorn.ModuleStarted) bool {
-				return started.ID == idA
-			},
-		)(aStore.evts[1]))
+		t.Parallel()
+		testDependentModules(t)
 	})
+}
+
+//nolint:funlen
+func testDependentModules(t *testing.T) {
+	t.Helper()
+	is := newIs(t)
+	ctx := context.Background()
+
+	ctx, cf := signal.NotifyContext(ctx, syscall.SIGINT, syscall.SIGTERM)
+	defer cf()
+
+	bus, err := popcorn.NewBus()
+	is.NoErr(err)
+
+	var stopModuleA eventCb = func(_ popcorn.Event) {
+		err := bus.Send(ctx, popcorn.NewEvent[popcorn.ModuleStatusChanged](idA, popcorn.ModuleStatusChanged{
+			ID:    idA,
+			From:  popcorn.ModuleStateOK,
+			To:    popcorn.ModuleStateNOK,
+			Cause: "the other module has started",
+		}))
+
+		// CR: FIXME: should I get the context.Canceled error here?
+		is.NoCtxErr(err)
+	}
+
+	aStore, aChan := newEventStore(
+		t,
+		stopModuleA.when(payloadMatches(
+			func(started popcorn.ModuleStarted) bool { return started.ID == idA },
+		)),
+	)
+	defer aStore.startStoring(aChan)()
+
+	modA, err := popcorn.NewModule(popcorn.ModRecipe{
+		ID:           idA,
+		Dependencies: []string{idB},
+		EventsChan:   aChan,
+		Start: func(_ context.Context) (popcorn.StopFunc, error) {
+			slog.InfoContext(ctx, "module starting", attr.ModID(idA))
+
+			return func(_ context.Context) error {
+				slog.InfoContext(ctx, "module stopping", attr.ModID(idA))
+				return nil
+			}, nil
+		},
+	})
+	is.NoErr(err)
+
+	modB, err := popcorn.NewModule(popcorn.ModRecipe{
+		ID: idB,
+		Start: func(_ context.Context) (popcorn.StopFunc, error) {
+			log.Printf("module b starting")
+			return func(_ context.Context) error { return nil }, nil
+		},
+	})
+	is.NoErr(err)
+
+	kernel, err := popcorn.NewKernel(
+		popcorn.WithBus(bus),
+		popcorn.WithLogger(slog.New(slog.NewTextHandler(os.Stderr, &slog.HandlerOptions{Level: slog.LevelDebug}))),
+		popcorn.WithModules(modA, modB),
+	)
+	is.NoErr(err)
+
+	err = kernel.Start(ctx)
+
+	unhealthy := popcorn.KernelUnhealthyError{}
+	if !errors.As(err, &unhealthy) {
+		is.NoErr(err)
+	}
+
+	is.True(strings.Contains(unhealthy.Error(), idA))
+
+	is.Equal(len(aStore.evts), 2)
+	is.True(payloadMatches[popcorn.ModuleStarted](
+		func(started popcorn.ModuleStarted) bool {
+			return started.ID == idB
+		},
+	)(aStore.evts[0]))
+	is.True(payloadMatches[popcorn.ModuleStarted](
+		func(started popcorn.ModuleStarted) bool {
+			return started.ID == idA
+		},
+	)(aStore.evts[1]))
 }
 
 func newEventStore(t *testing.T, cbs ...eventCb) (store eventStore, events chan popcorn.Event) {
@@ -114,6 +122,7 @@ func newEventStore(t *testing.T, cbs ...eventCb) (store eventStore, events chan 
 		t:         t,
 		callBacks: cbs,
 	}
+
 	return store, make(chan popcorn.Event)
 }
 
@@ -143,8 +152,12 @@ func payloadIs[T any]() eventFilter {
 }
 
 func payloadMatches[T any](f func(T) bool) eventFilter {
-	return payloadIs[T]().and(func(event popcorn.Event) bool {
-		p := event.Payload.(T)
+	return payloadIs[T]().and(func(evt popcorn.Event) bool {
+		p, ok := evt.Payload.(T)
+		if !ok {
+			return false
+		}
+
 		return f(p)
 	})
 }
@@ -159,7 +172,8 @@ func (s *eventStore) startStoring(c <-chan popcorn.Event) func() {
 	ctx := context.Background()
 	ctx, cf := context.WithCancel(ctx)
 
-	fmt.Printf("listening for events: %p\n", c)
+	s.t.Logf("listening for events: %p", c)
+
 	go func() {
 		for {
 			select {
@@ -187,7 +201,8 @@ type popIs struct {
 }
 
 func (is *popIs) NoCtxErr(err error) {
-	is.I.Helper()
+	is.Helper()
+
 	switch {
 	case errors.Is(err, context.Canceled):
 		return

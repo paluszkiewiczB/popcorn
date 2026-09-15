@@ -1,14 +1,10 @@
-// Package popcorn is the PROPOSED public API of the popcorn microframework.
+// Package popcorn is a microframework for building modular applications: a
+// dependency-ordered [Kernel] driving [Module]s, and an event [Bus] as the
+// single communication mechanism — including health, which is just an event.
 //
-// This file is a design draft only. It contains no implementation: every function
-// body panics with "not implemented". Its purpose is to pin down the shape,
-// ownership rules, and ergonomics of the API before any code is written.
-//
-// It lives in its own nested module (review/go.mod) so it is excluded from the root
-// module's `./...` patterns and does not affect `go build ./...`, `go vet ./...`, or
-// `task lint`. Type-check the draft with:
-//
-//	cd review && go build ./...
+// This file is the complete public API. Implementation is contract-driven:
+// every function body currently panics with "not implemented"; the tests in
+// package popcorn_test define the contract they must fulfill.
 //
 // Design philosophy:
 //
@@ -84,7 +80,6 @@ type StopFunc func(ctx context.Context) error
 
 // StopFuncFromCloser adapts an io.Closer to a StopFunc. It returns nil for a nil
 // closer, so it is safe to write `return popcorn.StopFuncFromCloser(res), nil`.
-// REVIEW: StopCloser
 func StopFuncFromCloser(c io.Closer) StopFunc { panic("not implemented") }
 
 // ============================================================================
@@ -205,11 +200,7 @@ type Publisher interface {
 // subscription ring is full the oldest event is overwritten. A slow subscriber can
 // only overflow its own ring; it can never stall Send, another subscriber, or the
 // kernel.
-// REVIEW: buffering on started consumer could be simply moved to a buffered channel.
-// The Bus ring-buffer is mostly there to support replaying event which were emitted before module was started.
-// Should we buffer the events ONLY before Start and then omit it completely?
 type Bus struct {
-	// unexported fields omitted from the draft
 }
 
 // NewBus creates a Bus.
@@ -282,7 +273,6 @@ type subConfig struct {
 // The Kernel owns no event channels. It publishes lifecycle events through a bound
 // Publisher and subscribes to ModuleStateChanged for health, best-effort.
 type Kernel struct {
-	// unexported fields omitted from the draft
 }
 
 // NewKernel creates a Kernel. It validates modules, resolves the dependency graph,

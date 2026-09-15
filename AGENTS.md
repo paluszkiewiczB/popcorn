@@ -1,7 +1,7 @@
 <!-- gitnexus:start -->
 # GitNexus — Code Intelligence
 
-This project is indexed by GitNexus as **popcorn** (464 symbols, 1316 relationships, 21 execution flows). Use the GitNexus MCP tools to understand code, assess impact, and navigate safely.
+This project is indexed by GitNexus as **popcorn** (293 symbols, 951 relationships, 0 execution flows). Use the GitNexus MCP tools to understand code, assess impact, and navigate safely.
 
 > If any GitNexus tool warns the index is stale, run `npx gitnexus analyze` in terminal first.
 
@@ -41,3 +41,40 @@ This project is indexed by GitNexus as **popcorn** (464 symbols, 1316 relationsh
 | Index, status, clean, wiki CLI commands | `.claude/skills/gitnexus/gitnexus-cli/SKILL.md` |
 
 <!-- gitnexus:end -->
+
+# Testing conventions
+
+The suite lives in a black-box `popcorn_test` package using
+[matryer/is](https://github.com/matryer/is) as the assertion library.
+
+## Why the tests are "bloated" with trailing comments
+
+Nearly every `is.*` call carries a trailing comment:
+
+```go
+is.True(err != nil) // Subscribe must reject an empty id
+```
+
+**This is not documentation.** It duplicates the assertion intentionally:
+`is` uses the trailing comment at the call site as the **assertion failure
+message** — on failure it prints the asserted expression *and* that comment
+together with file:line.
+
+```text
+^{- this assertion failed. Perhaps you meant: ...}
+...Subscribe must reject an empty id; stack: Subscribe("");
+[is] give some context instead of logging purely around line-numbers
+```
+
+Consequently:
+- Treat that comment as part of the assertion itself — it must state the
+  *contract being enforced*, keep it short, imperative, and written so it
+  reads sanely when pasted into a test-failure log.
+- Never delete or "clean up" these comments as redundant. (they are messages,
+  not prose).
+- Use the same style when adding is-level assertions. Comments that explain
+  deeper design rationale sit on preceding lines instead.
+
+Do not rewrite tests to standard `t.Fatalf`/stdtesting idioms; the contract
+suite relies on `is` intentionally (see `contract_test.go` for the kit and
+rules of engagement).

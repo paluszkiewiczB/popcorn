@@ -3,212 +3,146 @@ package popcorn_test
 import (
 	"context"
 	"errors"
-	"log"
-	"log/slog"
-	"os"
-	"os/signal"
-	"reflect"
-	"strings"
-	"syscall"
 	"testing"
+	"time"
 
 	"github.com/matryer/is"
-	"github.com/paluszkiewiczB/popcorn"
-	"github.com/paluszkiewiczB/popcorn/plog/attr"
+	popcorn "github.com/paluszkiewiczB/popcorn"
 )
 
-const (
-	idA = "a"
-	idB = "b"
-	idC = "c"
-)
+// The hermetic end-to-end contracts: whole-system behavior inside one
+// process - no network, no example code.
+func Test_E2E(test *testing.T) {
+	test.Run("ping story", func(t *testing.T) {
+		is := is.New(t)
 
-func Test_DependentModules(t *testing.T) {
-	t.Parallel()
-	t.Run("module b should be started before module a, because it has a dependency", func(t *testing.T) {
-		t.Parallel()
-		testDependentModules(t)
-	})
-}
+		b := newBus(t, popcorn.WithReplayBuffer(8))
 
-//nolint:funlen
-func testDependentModules(t *testing.T) {
-	t.Helper()
-	is := newIs(t)
-	ctx := context.Background()
+		const rounds = 3
+		producerDone := make(chan struct{})
+		collectorDone := make(chan struct{})
 
-	ctx, cf := signal.NotifyContext(ctx, syscall.SIGINT, syscall.SIGTERM)
-	defer cf()
-
-	bus, err := popcorn.NewBus()
-	is.NoErr(err)
-
-	var stopModuleA eventCb = func(_ popcorn.Event) {
-		err := bus.Send(ctx, popcorn.NewEvent[popcorn.ModuleStatusChanged](idA, popcorn.ModuleStatusChanged{
-			ID:    idA,
-			From:  popcorn.ModuleStateOK,
-			To:    popcorn.ModuleStateNOK,
-			Cause: "the other module has started",
-		}))
-
-		// CR: FIXME: should I get the context.Canceled error here?
-		is.NoCtxErr(err)
-	}
-
-	aStore, aChan := newEventStore(
-		t,
-		stopModuleA.when(payloadMatches(
-			func(started popcorn.ModuleStarted) bool { return started.ID == idA },
-		)),
-	)
-	defer aStore.startStoring(aChan)()
-
-	modA, err := popcorn.NewModule(popcorn.ModRecipe{
-		ID:           idA,
-		Dependencies: []string{idB},
-		EventsChan:   aChan,
-		Start: func(_ context.Context) (popcorn.StopFunc, error) {
-			slog.InfoContext(ctx, "module starting", attr.ModID(idA))
-
-			return func(_ context.Context) error {
-				slog.InfoContext(ctx, "module stopping", attr.ModID(idA))
-				return nil
-			}, nil
-		},
-	})
-	is.NoErr(err)
-
-	modB, err := popcorn.NewModule(popcorn.ModRecipe{
-		ID: idB,
-		Start: func(_ context.Context) (popcorn.StopFunc, error) {
-			log.Printf("module b starting")
-			return func(_ context.Context) error { return nil }, nil
-		},
-	})
-	is.NoErr(err)
-
-	kernel, err := popcorn.NewKernel(
-		popcorn.WithBus(bus),
-		popcorn.WithLogger(slog.New(slog.NewTextHandler(os.Stderr, &slog.HandlerOptions{Level: slog.LevelDebug}))),
-		popcorn.WithModules(modA, modB),
-	)
-	is.NoErr(err)
-
-	err = kernel.Start(ctx)
-
-	unhealthy := popcorn.KernelUnhealthyError{}
-	if !errors.As(err, &unhealthy) {
-		is.NoErr(err)
-	}
-
-	is.True(strings.Contains(unhealthy.Error(), idA))
-
-	is.Equal(len(aStore.evts), 2)
-	is.True(payloadMatches[popcorn.ModuleStarted](
-		func(started popcorn.ModuleStarted) bool {
-			return started.ID == idB
-		},
-	)(aStore.evts[0]))
-	is.True(payloadMatches[popcorn.ModuleStarted](
-		func(started popcorn.ModuleStarted) bool {
-			return started.ID == idA
-		},
-	)(aStore.evts[1]))
-}
-
-func newEventStore(t *testing.T, cbs ...eventCb) (store eventStore, events chan popcorn.Event) {
-	t.Helper()
-	store = eventStore{
-		t:         t,
-		callBacks: cbs,
-	}
-
-	return store, make(chan popcorn.Event)
-}
-
-type eventFilter func(popcorn.Event) bool
-
-func (f eventFilter) and(next eventFilter) eventFilter {
-	return func(event popcorn.Event) bool {
-		return f(event) && next(event)
-	}
-}
-
-type eventCb func(popcorn.Event)
-
-func (cb eventCb) when(f eventFilter) eventCb {
-	return func(event popcorn.Event) {
-		if f(event) {
-			cb(event)
-		}
-	}
-}
-
-func payloadIs[T any]() eventFilter {
-	return func(evt popcorn.Event) bool {
-		var t T
-		return reflect.TypeOf(evt.Payload) == reflect.TypeOf(t)
-	}
-}
-
-func payloadMatches[T any](f func(T) bool) eventFilter {
-	return payloadIs[T]().and(func(evt popcorn.Event) bool {
-		p, ok := evt.Payload.(T)
-		if !ok {
-			return false
-		}
-
-		return f(p)
-	})
-}
-
-type eventStore struct {
-	t         *testing.T
-	evts      []popcorn.Event
-	callBacks []eventCb
-}
-
-func (s *eventStore) startStoring(c <-chan popcorn.Event) func() {
-	ctx := context.Background()
-	ctx, cf := context.WithCancel(ctx)
-
-	s.t.Logf("listening for events: %p", c)
-
-	go func() {
-		for {
-			select {
-			case <-ctx.Done():
-				return
-			case event := <-c:
-				s.evts = append(s.evts, event)
-				for _, cb := range s.callBacks {
-					cb(event)
+		// producer: sends `rounds` pings, then signals done.
+		producerStart := func(ctx context.Context) (popcorn.StopFunc, error) {
+			pub := b.Publisher("producer")
+			for i := 0; i < rounds; i++ {
+				if err := pub.Send(ctx, popcorn.NewEvent(tick{N: i})); err != nil {
+					return nil, err
 				}
 			}
+			close(producerDone)
+			return nil, nil
 		}
-	}()
 
-	return cf
-}
+		// collector: subscribes into the bus itself, acknowledges health,
+		// then finishes once a full round is seen.
+		received := make(chan []int, 1)
 
-func newIs(t *testing.T) *popIs {
-	t.Helper()
-	return &popIs{I: is.New(t)}
-}
+		collectorStart := func(ctx context.Context) (popcorn.StopFunc, error) {
+			ch, err := b.Subscribe("collector", popcorn.WithBacklog(rounds))
+			if err != nil {
+				return nil, err
+			}
 
-type popIs struct {
-	*is.I
-}
+			pub := b.Publisher("collector")
+			if err := pub.Send(ctx, popcorn.NewEvent(
+				popcorn.ModuleStateChanged{To: popcorn.ModuleStateOK})); err != nil {
+				return nil, err
+			}
 
-func (is *popIs) NoCtxErr(err error) {
-	is.Helper()
+			go func() {
+				var got []int
+				for len(got) < rounds {
+					e := <-ch
+					if tk, ok := e.Payload.(tick); ok {
+						got = append(got, tk.N)
+					}
+				}
+				close(collectorDone)
+				received <- got
+			}()
 
-	switch {
-	case errors.Is(err, context.Canceled):
-		return
-	case errors.Is(err, context.DeadlineExceeded):
-		return
-	default:
+			return func(context.Context) error { return nil }, nil
+		}
+
+		producer, err := popcorn.NewModule(popcorn.ModRecipe{
+			ID:           "producer",
+			Dependencies: []string{"collector"},
+			Start:        producerStart,
+			Done:         producerDone,
+		})
 		is.NoErr(err)
-	}
+
+		collector, err := popcorn.NewModule(popcorn.ModRecipe{
+			ID:    "collector",
+			Start: collectorStart,
+			Done:  collectorDone,
+		})
+		is.NoErr(err)
+
+		k, err := popcorn.NewKernel(popcorn.WithBus(b),
+			popcorn.WithParallelism(1),
+			popcorn.WithModules(collector, producer))
+		is.NoErr(err)
+
+		ctx, cancel := within()
+		defer cancel()
+
+		// Both modules are TaskModules that report Done; the kernel must exit
+		// gracefully once both are done.
+		is.True(errors.Is(k.Start(ctx), popcorn.ErrKernelStopped))
+
+		select {
+		case got := <-received:
+			is.Equal(got, []int{0, 1, 2}) // collector must see every published ping exactly once
+		case <-time.After(never):
+			is.Fail() // collector never received a full round
+		}
+	})
+
+	test.Run("failure path", func(t *testing.T) {
+		is := is.New(t)
+
+		b := newBus(t, popcorn.WithReplayBuffer(8))
+		stops := make(chan string, 8)
+
+		failing, err := popcorn.NewModule(popcorn.ModRecipe{
+			ID:    "failing",
+			Start: healthStart("failing", b, popcorn.ModuleStateNOK, errors.New("connection refused")),
+			Done:  closeOnStart(),
+		})
+		is.NoErr(err)
+
+		// Healthy long-running peer: must receive a stop call once the fleet
+		// shuts down due to the NOK report - failures shut the fleet down,
+		// they do not abandon it.
+		healthy, err := popcorn.NewModule(popcorn.ModRecipe{
+			ID:           "healthy",
+			Dependencies: []string{"failing"},
+			Start: func(context.Context) (popcorn.StopFunc, error) {
+				return stopped(stops, "healthy"), nil
+			},
+		})
+		is.NoErr(err)
+
+		k, err := popcorn.NewKernel(popcorn.WithBus(b),
+			popcorn.WithParallelism(1),
+			popcorn.WithModules(failing, healthy))
+		is.NoErr(err)
+
+		ctx, cancel := within()
+		defer cancel()
+
+		err = k.Start(ctx)
+		var unhealthy popcorn.KernelUnhealthyError
+		is.True(errors.As(err, &unhealthy))
+		is.Equal(unhealthy.ModuleID, "failing")
+
+		select {
+		case id := <-stops:
+			is.Equal(id, "healthy") // the healthy peer must be stopped on NOK shutdown
+		case <-time.After(never):
+			is.Fail() // healthy peer never got a stop call
+		}
+	})
 }

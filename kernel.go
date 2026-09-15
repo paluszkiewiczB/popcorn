@@ -203,9 +203,8 @@ func (k *Kernel) Start(ctx context.Context) error {
 	// CR: are you sure it's thread safe?
 	// SetBuffering(false), reading from the buffer and then clearing it are not atomic
 	// so an event emitted just after the startup might be LOST due to time-of-check vs time-of-delete data race
-	k.bus.SetBuffering(true)
-	defer k.bus.SetBuffering(false)
-	defer k.bus.ClearBuffer()
+	k.bus.StartBuffering()
+	defer k.bus.FinishBuffering() //nolint:contextcheck
 
 	// CR: should we use background here?
 	kernelEvents := make(chan Event, 1)

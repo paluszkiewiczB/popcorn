@@ -1,0 +1,17 @@
+{
+  "$schema": "https://raw.githubusercontent.com/jetify-com/devbox/0.17.5/.schema/devbox.schema.json",
+  "packages": [
+    "go-task@3.48.0",
+    "gofumpt@0.11.0",
+    "gotools@0.44.0",
+    "gopls@0.22.0",
+    "go@1.27.0",
+    "golangci-lint@2.13.1"
+  ],
+  "env": {
+    "PATH": "$PATH:$PWD/bin"
+  },
+  "shell": {
+    "init_hook": ["echo 'devbox: popcorn environment ready'"]
+  }
+}

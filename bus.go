@@ -1,7 +1,5 @@
 package popcorn
 
-// CR: shouldn't it accept `plog.Logger`?
-
 import (
 	"context"
 	"errors"
@@ -10,12 +8,13 @@ import (
 	"maps"
 	"slices"
 	"sync"
-	"sync/atomic"
 	"time"
 
 	"github.com/paluszkiewiczB/popcorn/plog"
 	"github.com/paluszkiewiczB/popcorn/plog/attr"
 )
+
+// CR: shouldn't it accept `plog.Logger`?
 
 // ErrEmptyID is returned when trying to subscribe with an empty id.
 var ErrEmptyID = errors.New("listener id is empty")
@@ -33,9 +32,11 @@ type Bus struct {
 	timeout   time.Duration
 	log       plog.Logger
 
-	shouldBuf atomic.Bool
-	bufMu     sync.Mutex
-	buf       []Event
+	bufMu        sync.Mutex
+	flushCond    *sync.Cond
+	buffering    bool
+	buf          []Event
+	pendingSends int
 }
 
 type busConfig struct {
@@ -74,15 +75,15 @@ func NewBus(opts ...BusOption) (*Bus, error) {
 		}
 	}
 
-	return &Bus{
+	bus := &Bus{
 		mu:        sync.RWMutex{},
 		listeners: make(map[string]chan<- Event),
 		timeout:   cfg.timeout,
 		log:       cfg.log,
-		shouldBuf: atomic.Bool{},
 		bufMu:     sync.Mutex{},
-		buf:       nil,
-	}, nil
+	}
+	bus.flushCond = sync.NewCond(&bus.bufMu)
+	return bus, nil
 }
 
 // Subscribe registers a channel to receive events for the given id.
@@ -96,13 +97,23 @@ func (b *Bus) Subscribe(id string, ch chan<- Event) error {
 	}
 
 	b.mu.Lock()
-	defer b.mu.Unlock()
-
 	if _, ok := b.listeners[id]; ok {
+		b.mu.Unlock()
 		return ErrDuplicateID
 	}
-
 	b.listeners[id] = ch
+	b.mu.Unlock()
+
+	b.bufMu.Lock()
+	if b.buffering {
+		for _, e := range b.buf {
+			select {
+			case ch <- e:
+			default:
+			}
+		}
+	}
+	b.bufMu.Unlock()
 
 	return nil
 }
@@ -112,15 +123,62 @@ func (b *Bus) Unsubscribe(id string) {
 	if b == nil {
 		return
 	}
+
 	b.mu.Lock()
 	defer b.mu.Unlock()
 
 	delete(b.listeners, id)
 }
 
+// StartBuffering enables event buffering for late subscribers.
+// Events sent while buffering is active are stored and replayed to
+// subscribers that join later. Any existing buffer is cleared first.
+func (b *Bus) StartBuffering() {
+	b.bufMu.Lock()
+	b.buf = nil
+	b.buffering = true
+	b.bufMu.Unlock()
+}
+
+// FinishBuffering disables buffering and delivers any remaining
+// buffered events to all current subscribers.
+func (b *Bus) FinishBuffering() {
+	b.bufMu.Lock()
+	for b.pendingSends > 0 {
+		b.flushCond.Wait()
+	}
+	remaining := b.buf
+	b.buf = nil
+	b.buffering = false
+	b.bufMu.Unlock()
+
+	b.mu.RLock()
+	chans := make([]chan<- Event, 0, len(b.listeners))
+	for _, ch := range b.listeners {
+		chans = append(chans, ch)
+	}
+	b.mu.RUnlock()
+
+	for _, e := range remaining {
+		go func(evt Event) {
+			for _, ch := range chans {
+				ch <- evt
+			}
+		}(e)
+	}
+}
+
 // SetBuffering enables or disables event buffering.
+//
+// Deprecated: use [Bus.StartBuffering] and [Bus.FinishBuffering].
 func (b *Bus) SetBuffering(v bool) {
-	b.shouldBuf.Store(v)
+	if v {
+		b.StartBuffering()
+	} else {
+		b.bufMu.Lock()
+		b.buffering = false
+		b.bufMu.Unlock()
+	}
 }
 
 // Buffer returns all buffered events.
@@ -131,12 +189,11 @@ func (b *Bus) Buffer() []Event {
 	return slices.Clone(b.buf)
 }
 
-// ClearBuffer clears all buffered events.
+// ClearBuffer clears all buffered events and disables buffering.
+//
+// Deprecated: use [Bus.FinishBuffering].
 func (b *Bus) ClearBuffer() {
-	b.bufMu.Lock()
-	defer b.bufMu.Unlock()
-
-	b.buf = nil
+	b.FinishBuffering()
 }
 
 // Send sends an event to all registered listeners.
@@ -144,19 +201,27 @@ func (b *Bus) Send(ctx context.Context, e Event) error {
 	if b == nil {
 		return nil
 	}
-	if b.shouldBuf.Load() {
-		b.bufMu.Lock()
+
+	b.bufMu.Lock()
+	b.pendingSends++
+	if b.buffering {
 		b.buf = append(b.buf, e)
-		b.bufMu.Unlock()
 	}
+	b.pendingSends--
+	if b.pendingSends == 0 {
+		b.flushCond.Broadcast()
+	}
+	b.bufMu.Unlock()
 
 	noCancelCtx := context.WithoutCancel(ctx)
-
 	sendCtx, cancel := context.WithTimeout(noCancelCtx, b.timeout)
 	defer cancel()
 
+	return b.deliverToAll(sendCtx, e)
+}
+
+func (b *Bus) deliverToAll(ctx context.Context, e Event) error {
 	b.mu.RLock()
-	// CR: isn't it maps.Copy ?
 	listeners := make(map[string]chan<- Event, len(b.listeners))
 	maps.Copy(listeners, b.listeners)
 	b.mu.RUnlock()
@@ -168,19 +233,19 @@ func (b *Bus) Send(ctx context.Context, e Event) error {
 	)
 
 	for id, ch := range listeners {
-		if err := b.sendEvent(sendCtx, e, ch); err != nil {
+		if err := sendEvent(ctx, e, ch); err != nil {
 			b.log.LogAttrs(ctx, slog.LevelWarn, "failed to send event", attr.ModID(id), attr.Err(err))
 		}
 	}
 
-	if err := sendCtx.Err(); err != nil {
+	if err := ctx.Err(); err != nil {
 		return fmt.Errorf("send timeout: %w", err)
 	}
 
 	return nil
 }
 
-func (b *Bus) sendEvent(ctx context.Context, e Event, ch chan<- Event) error {
+func sendEvent(ctx context.Context, e Event, ch chan<- Event) error {
 	select {
 	case <-ctx.Done():
 		return fmt.Errorf("send failed: %w", ctx.Err())

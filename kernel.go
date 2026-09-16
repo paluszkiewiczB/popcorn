@@ -96,6 +96,7 @@ type moduleRun struct {
 	deps   []string
 	task   TaskModule
 	ready  chan struct{}
+	depth  int
 
 	// Guarded by kernelRun.kmu. stopOnce guarantees a module is stopped exactly
 	// once even if it finishes starting mid-shutdown.
@@ -117,6 +118,7 @@ type kernelRun struct {
 
 	runs       []*moduleRun
 	rts        map[string]*moduleRun
+	stopLevels [][]*moduleRun
 	totalTasks int
 	workers    int
 	slots      chan struct{}
@@ -154,6 +156,8 @@ func newKernelRun(ctx context.Context, cfg kernelConfig) (*kernelRun, error) {
 		wake:    make(chan struct{}, 1),
 	}
 	run.indexModules(cfg.modules)
+	run.assignDepths()
+	run.buildStopLevels()
 	run.slots = make(chan struct{}, max(1, run.workers))
 	run.stopSlots = make(chan struct{}, max(1, run.workers))
 
@@ -161,8 +165,8 @@ func newKernelRun(ctx context.Context, cfg kernelConfig) (*kernelRun, error) {
 	health, err := b.Subscribe(kernelID,
 		WithBacklog(healthBacklog),
 		WithFilter(func(e Event) bool {
-			_, ok := e.Payload.(ModuleStateChanged)
-			return ok
+			msc, ok := e.Payload.(ModuleStateChanged)
+			return ok && msc.To == ModuleStateNOK
 		}))
 	if err != nil {
 		if ownsBus {
@@ -215,6 +219,49 @@ func (run *kernelRun) indexModules(modules []Module) {
 	run.workers = run.cfg.parallelism
 	if run.workers <= 0 {
 		run.workers = len(run.runs) // 0 means no cap
+	}
+}
+
+// assignDepths computes depth(m) = 0 for a module with no dependencies, else
+// 1 + max(depth(dep)). The graph is acyclic (validateModules rejects cycles), so
+// the memoized recursion terminates. Dependencies always have a strictly smaller
+// depth, so stopping in descending depth order is dependency-safe.
+func (run *kernelRun) assignDepths() {
+	depths := make(map[string]int, len(run.runs))
+	var visit func(id string) int
+	visit = func(id string) int {
+		if d, ok := depths[id]; ok {
+			return d
+		}
+		r := run.rts[id]
+		depth := 0
+		for _, dep := range r.deps {
+			if d := visit(dep) + 1; d > depth {
+				depth = d
+			}
+		}
+		r.depth = depth
+		depths[id] = depth
+		return depth
+	}
+	for _, r := range run.runs {
+		visit(r.id)
+	}
+}
+
+// buildStopLevels groups every module by depth. stopStarted walks the levels in
+// descending order, stopping a whole wave concurrently. Not-yet-started modules
+// are included; stopModule no-ops them.
+func (run *kernelRun) buildStopLevels() {
+	maxDepth := 0
+	for _, r := range run.runs {
+		if r.depth > maxDepth {
+			maxDepth = r.depth
+		}
+	}
+	run.stopLevels = make([][]*moduleRun, maxDepth+1)
+	for _, r := range run.runs {
+		run.stopLevels[r.depth] = append(run.stopLevels[r.depth], r)
 	}
 }
 
@@ -433,6 +480,12 @@ func (run *kernelRun) handleEvent(ctx context.Context, event loopEvent, payload 
 	case eventTick:
 		// health is re-checked at the top of the loop
 	case eventIdle:
+		// A NOK may be queued from before the idle wake but have lost the
+		// select to it (both cases were ready). Drain health once more so an
+		// idle completion can never mask a reported failure.
+		if herr := run.checkHealth(); herr != nil {
+			return false, run.finish(ctx, herr)
+		}
 		if run.isIdle() {
 			return false, errors.Join(append(run.shutdown(ctx, nil),
 				fmt.Errorf("kernel finished its work: %w", ErrKernelStopped))...)
@@ -522,40 +575,36 @@ func (run *kernelRun) stopStarted(ctx context.Context, deadline time.Time) []err
 	var (
 		mu   sync.Mutex
 		errs []error
-		wg   sync.WaitGroup
 	)
-	stop := func(r *moduleRun) {
-		defer wg.Done()
-		if err := run.stopModule(ctx, r, deadline); err != nil {
-			mu.Lock()
-			errs = append(errs, err)
-			mu.Unlock()
+	collect := func(err error) {
+		if err == nil {
+			return
 		}
+		mu.Lock()
+		errs = append(errs, err)
+		mu.Unlock()
 	}
-	if run.workers <= 1 {
-		for _, r := range slices.Backward(run.runs) {
-			wg.Add(1)
-			stop(r)
+	for _, level := range slices.Backward(run.stopLevels) {
+		if run.workers <= 1 {
+			for _, r := range level {
+				collect(run.stopModule(ctx, r, deadline))
+			}
+			continue
 		}
-	} else {
-		for _, r := range slices.Backward(run.runs) {
-			wg.Add(1)
-			go func() {
-				// A module stuck in Start holds its start slot, so stops need
-				// their own capacity. The shared deadline bounds the wait.
-				timer := time.NewTimer(time.Until(deadline))
-				defer timer.Stop()
-				select {
-				case run.stopSlots <- struct{}{}:
-					defer func() { <-run.stopSlots }()
-					stop(r)
-				case <-timer.C:
-					wg.Done()
-				}
-			}()
+		// A module stuck in Start holds its start slot, so stops need their own
+		// capacity. Every stopModule is deadline-bounded, so waiting for a slot
+		// cannot outlive the shared deadline. A wave is joined before descending
+		// so a dependency is never stopped before its dependents.
+		var wg sync.WaitGroup
+		for _, r := range level {
+			wg.Go(func() {
+				run.stopSlots <- struct{}{}
+				defer func() { <-run.stopSlots }()
+				collect(run.stopModule(ctx, r, deadline))
+			})
 		}
+		wg.Wait()
 	}
-	wg.Wait()
 	return errs
 }
 
@@ -654,8 +703,10 @@ func WithStopTimeout(d time.Duration) KernelOption {
 	}
 }
 
-// WithParallelism caps how many modules start/stop concurrently. 1 is sequential;
-// 0 means no cap.
+// WithParallelism caps how many modules start concurrently, and how many stop
+// concurrently within a wave. 1 is sequential; 0 means no cap. Stops always run in
+// descending dependency-depth waves: every dependent is stopped before anything it
+// depends on, while modules at the same depth stop concurrently.
 func WithParallelism(p int) KernelOption {
 	return func(cfg *kernelConfig) error {
 		if p < 0 {

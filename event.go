@@ -68,8 +68,9 @@ type ModuleStarted struct {
 
 // ModuleStateChanged is emitted by a Module to report a health transition. The
 // module is identified by Event.Source, which the Kernel validates against the
-// registered modules. Modules report only the new state; the Kernel records the
-// previous state and validates the transition.
+// registered modules. Modules report only the new state; the Kernel consumes only
+// ModuleStateNOK and treats it as a shutdown trigger, while the other states are
+// meant for independent subscribers such as probes.
 type ModuleStateChanged struct {
 	To    ModuleState
 	Cause error

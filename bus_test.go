@@ -351,6 +351,71 @@ func TestBusReplay(t *testing.T) {
 		})
 	})
 
+	t.Run("default replay buffer keeps the last 64 events", func(t *testing.T) {
+		t.Parallel()
+		synctest.Test(t, func(t *testing.T) {
+			is := is.New(t)
+
+			b := newBus(t) // no option: the 64-event default applies
+			pub := b.Publisher("p")
+			for i := 1; i <= 100; i++ {
+				is.NoErr(pub.Send(context.Background(), popcorn.NewEvent(tick{N: i})))
+			}
+
+			late, err := b.Subscribe("late", popcorn.WithBacklog(64))
+			is.NoErr(err)
+
+			got := drained(is, late)
+			is.Equal(len(got), 64) // the default bound is 64
+			for i, e := range got {
+				is.Equal(e.Payload, tick{N: i + 37}) // the newest 64, oldest first
+			}
+		})
+	})
+
+	t.Run("zero replay buffer disables history", func(t *testing.T) {
+		t.Parallel()
+		synctest.Test(t, func(t *testing.T) {
+			is := is.New(t)
+
+			b := newBus(t, popcorn.WithReplayBuffer(0))
+			pub := b.Publisher("p")
+			for i := 1; i <= 5; i++ {
+				is.NoErr(pub.Send(context.Background(), popcorn.NewEvent(tick{N: i})))
+			}
+
+			late, err := b.Subscribe("late", popcorn.WithBacklog(8))
+			is.NoErr(err)
+
+			is.Equal(len(drained(is, late)), 0) // WithReplayBuffer(0) must retain nothing
+		})
+	})
+
+	t.Run("ring wraps around across multiple cycles", func(t *testing.T) {
+		t.Parallel()
+		synctest.Test(t, func(t *testing.T) {
+			is := is.New(t)
+
+			// Cap 3 with 10 sends crosses the ring boundary more than twice.
+			b := newBus(t, popcorn.WithReplayBuffer(3))
+			pub := b.Publisher("p")
+			for i := 1; i <= 10; i++ {
+				is.NoErr(pub.Send(context.Background(), popcorn.NewEvent(tick{N: i})))
+			}
+
+			late, err := b.Subscribe("late", popcorn.WithBacklog(8))
+			is.NoErr(err)
+
+			replayed := make([]int, 0, 8)
+			for _, e := range drained(is, late) {
+				tk, ok := e.Payload.(tick)
+				is.True(ok) // every replayed event must carry a tick payload
+				replayed = append(replayed, tk.N)
+			}
+			is.Equal(replayed, []int{8, 9, 10}) // only the newest cap survive, in order
+		})
+	})
+
 	t.Run("no gap, no duplicate at the seam", func(t *testing.T) {
 		t.Parallel()
 		synctest.Test(t, func(t *testing.T) {

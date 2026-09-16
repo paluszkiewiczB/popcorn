@@ -9,7 +9,7 @@ import (
 	"sync"
 )
 
-const defaultHistoryCap = 1024
+const defaultHistoryCap = 64
 
 var (
 	errNilBus             = errors.New("nil bus")
@@ -31,14 +31,16 @@ var (
 type Bus struct {
 	cfg busConfig
 
-	mu      sync.Mutex
-	subs    map[string]*subscription
-	history []Event
+	mu       sync.Mutex
+	subs     map[string]*subscription
+	history  []Event
+	histHead int
+	histLen  int
 }
 
 // NewBus creates a Bus.
 func NewBus(opts ...BusOption) (*Bus, error) {
-	cfg := busConfig{log: discardLogger()}
+	cfg := busConfig{log: discardLogger(), replayBuffer: defaultHistoryCap}
 	for _, opt := range opts {
 		if err := opt(&cfg); err != nil {
 			return nil, err
@@ -47,10 +49,14 @@ func NewBus(opts ...BusOption) (*Bus, error) {
 	if cfg.log == nil {
 		cfg.log = discardLogger()
 	}
-	return &Bus{
+	b := &Bus{
 		cfg:  cfg,
 		subs: map[string]*subscription{},
-	}, nil
+	}
+	if cfg.replayBuffer > 0 {
+		b.history = make([]Event, cfg.replayBuffer)
+	}
+	return b, nil
 }
 
 // Subscribe creates a subscription and returns its receive-only channel. The Bus
@@ -152,15 +158,13 @@ func (b *Bus) Publisher(id string) *Publisher {
 }
 
 func (b *Bus) seed(s *subscription) {
-	if s.unbuffered() {
+	if s.unbuffered() || len(b.history) == 0 {
 		return
 	}
 	backlog := cap(s.ch)
-	matched := make([]Event, 0, backlog)
-	for _, e := range slices.Backward(b.history) {
-		if len(matched) >= backlog {
-			break
-		}
+	matched := make([]Event, 0, min(backlog, b.histLen))
+	for i := 0; i < b.histLen && len(matched) < backlog; i++ {
+		e := b.history[(b.histHead+b.histLen-1-i)%len(b.history)]
 		if s.filter == nil || s.filter(e) {
 			matched = append(matched, e)
 		}
@@ -173,19 +177,19 @@ func (b *Bus) seed(s *subscription) {
 	}
 }
 
-func (b *Bus) replayCap() int {
-	if b.cfg.replayBuffer > 0 {
-		return b.cfg.replayBuffer
-	}
-	return defaultHistoryCap
-}
-
+// remember writes e into the fixed-length history ring in O(1). The ring is
+// empty when replay is disabled, in which case nothing is retained.
 func (b *Bus) remember(e Event) {
-	hc := b.replayCap()
-	b.history = append(b.history, e)
-	if len(b.history) > hc {
-		b.history = append(b.history[:0], b.history[len(b.history)-hc:]...)
+	if len(b.history) == 0 {
+		return
 	}
+	if b.histLen < len(b.history) {
+		b.history[(b.histHead+b.histLen)%len(b.history)] = e
+		b.histLen++
+		return
+	}
+	b.history[b.histHead] = e
+	b.histHead = (b.histHead + 1) % len(b.history)
 }
 
 func (s *subscription) offer(e Event) {
@@ -372,9 +376,9 @@ type BusOption func(*busConfig) error
 
 // WithReplayBuffer sets the maximum number of recent events the Bus retains for
 // replay. A buffered subscription (WithBacklog > 0) is seeded with up to its backlog
-// of the most recent matching events before live delivery begins. A non-positive n
-// keeps the default bound (1024); a positive n replaces it. Rendezvous subscriptions
-// have no ring and are never seeded.
+// of the most recent matching events before live delivery begins. A positive n sets
+// the bound; the default is 64; n == 0 disables replay; a negative n errors.
+// Rendezvous subscriptions have no ring and are never seeded.
 func WithReplayBuffer(n int) BusOption {
 	return func(cfg *busConfig) error {
 		if n < 0 {

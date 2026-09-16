@@ -614,8 +614,8 @@ func TestKernelFailures(t *testing.T) {
 			defer cancel()
 
 			err = k.Start(ctx)
-			var unhealthy popcorn.KernelUnhealthyError
-			is.True(errors.As(err, &unhealthy)) // NOK report must stop the kernel
+			unhealthy, ok := errors.AsType[popcorn.KernelUnhealthyError](err)
+			is.True(ok) // NOK report must stop the kernel
 			is.Equal(unhealthy.ModuleID, "sick")
 			is.True(errors.Is(unhealthy.Cause, errDiskFull))
 		})
@@ -663,8 +663,8 @@ func TestKernelFailures(t *testing.T) {
 			})))
 
 			err = <-done
-			var unhealthy popcorn.KernelUnhealthyError
-			is.True(errors.As(err, &unhealthy)) // benign health must not stop the kernel
+			unhealthy, ok := errors.AsType[popcorn.KernelUnhealthyError](err)
+			is.True(ok) // benign health must not stop the kernel
 			is.Equal(unhealthy.ModuleID, "flappy")
 			is.True(errors.Is(unhealthy.Cause, errDiskFull))
 		})
@@ -710,8 +710,8 @@ func TestKernelFailures(t *testing.T) {
 			})))
 
 			err = <-done
-			var unhealthy popcorn.KernelUnhealthyError
-			is.True(errors.As(err, &unhealthy)) // a NOK after benign volume must still be actioned
+			unhealthy, ok := errors.AsType[popcorn.KernelUnhealthyError](err)
+			is.True(ok) // a NOK after benign volume must still be actioned
 			is.Equal(unhealthy.ModuleID, "flappy")
 			is.True(errors.Is(unhealthy.Cause, errDiskFull))
 		})
@@ -749,8 +749,8 @@ func TestKernelFailures(t *testing.T) {
 			})))
 
 			err = <-done
-			var unhealthy popcorn.KernelUnhealthyError
-			is.True(errors.As(err, &unhealthy))
+			unhealthy, ok := errors.AsType[popcorn.KernelUnhealthyError](err)
+			is.True(ok)
 			is.Equal(unhealthy.ModuleID, "long") // the spoofed source must be ignored
 			is.True(errors.Is(unhealthy.Cause, errDiskFull))
 		})
@@ -815,8 +815,8 @@ func TestKernelHealthLoss(t *testing.T) {
 
 			cancel()
 			err = <-done
-			var unhealthy popcorn.KernelUnhealthyError
-			is.True(!errors.As(err, &unhealthy)) // replayed health must not stop a fresh kernel
+			_, isUnhealthy := errors.AsType[popcorn.KernelUnhealthyError](err)
+			is.True(!isUnhealthy) // replayed health must not stop a fresh kernel
 			is.True(errors.Is(err, context.Canceled))
 		})
 	})

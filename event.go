@@ -7,19 +7,18 @@ import (
 	"time"
 )
 
-// Event is an asynchronous message sent over the Bus.
+// Event is an asynchronous message sent over the Bus. It is a lightweight value:
+// it is copied by value and is safe to compare and store.
 //
-// Event is a lightweight value: it is copied by value and is safe to compare and
-// store. Listeners filter by Kind and type-assert Payload against the expected type.
-//
-// Source is the only field managed by the framework: it is set by the bound
-// Publisher and read through Source().
+// A subscriber receives every event and filters locally, by Kind or by
+// type-asserting Payload. Source is set by the Publisher when the event is sent
+// and cannot be set by the caller.
 type Event struct {
-	// Kind is derived from the payload type by NewEvent, or supplied explicitly by
-	// NewEventOf. It should be globally unique.
+	// Kind identifies the event. NewEvent derives it from the payload type;
+	// NewEventOf sets it explicitly. It should be globally unique.
 	Kind string
 
-	// At is when the event happened. Listeners may use it to drop stale events.
+	// At is when the event was created. Listeners may use it to drop stale events.
 	At time.Time
 
 	// Payload is the event-specific value. Listeners assert its concrete type.
@@ -28,14 +27,14 @@ type Event struct {
 	source string
 }
 
-// NewEvent builds an Event whose Kind is the name of T. The source is filled in by
-// the Publisher when the event is sent; callers never set it.
+// NewEvent builds an Event whose Kind is the name of the payload type T. The
+// source is filled in by the Publisher on Send; callers never set it.
 func NewEvent[T any](payload T) Event {
 	return newEvent(kindOf(payload), payload)
 }
 
-// NewEventOf builds an Event with an explicit Kind. It is the escape hatch for cases
-// where the type-derived kind is not appropriate.
+// NewEventOf builds an Event with an explicit Kind. It is the escape hatch for
+// cases where the type-derived kind is not appropriate.
 func NewEventOf(kind string, payload any) Event {
 	return newEvent(kind, payload)
 }
@@ -59,32 +58,40 @@ func kindOf(payload any) string {
 // event is sent and cannot be set by the caller.
 func (e Event) Source() string { return e.source }
 
-// ModuleStarted is emitted by the Kernel after a Module has started successfully.
+// ModuleStarted is emitted by the Kernel after a Module has started
+// successfully.
 type ModuleStarted struct {
 	ID        string
 	Order     int
 	StartTook time.Duration
 }
 
-// ModuleStateChanged is emitted by a Module to report a health transition. The
-// module is identified by Event.Source, which the Kernel validates against the
-// registered modules. Modules report only the new state; the Kernel consumes only
-// ModuleStateNOK and treats it as a shutdown trigger, while the other states are
+// ModuleStateChanged reports a module's health. A module publishes it through a
+// Publisher bound to its own id, which the kernel validates against the
+// registered modules:
+//
+//	if err := bus.Publisher(id).Send(ctx, popcorn.NewEvent(
+//		popcorn.ModuleStateChanged{To: popcorn.ModuleStateOK},
+//	)); err != nil {
+//		// handle the send failure
+//	}
+//
+// The kernel treats [ModuleStateNOK] as a shutdown trigger; the other states are
 // meant for independent subscribers such as probes.
 type ModuleStateChanged struct {
 	To    ModuleState
 	Cause error
 }
 
-// KernelStateChanged is emitted by the Kernel on every lifecycle transition. The
-// Kernel owns this lifecycle, so it reports both ends of the transition.
-// Liveness/readiness/startup probes are ordinary consumers of this event.
+// KernelStateChanged reports a kernel lifecycle transition. The kernel publishes
+// both ends of every transition. Readiness, liveness, and startup probes consume
+// it like any other event.
 type KernelStateChanged struct {
 	From, To KernelState
 	Cause    error
 }
 
-// ModuleState is the health state of a module.
+// ModuleState is the health state a module reports.
 type ModuleState int32
 
 // ModuleState values describe a module's health.
@@ -111,7 +118,7 @@ func (s ModuleState) String() string {
 	}
 }
 
-// IsHealthy reports whether the state is OK.
+// IsHealthy reports whether the state is [ModuleStateOK].
 func (s ModuleState) IsHealthy() bool { return s == ModuleStateOK }
 
 // KernelState is the lifecycle state of the Kernel.

@@ -20,14 +20,13 @@ var (
 	errBacklog            = errors.New("backlog must not be negative")
 )
 
-// Bus is an in-process event bus with per-subscription, bounded, isolated delivery.
-// It is the single owner of every subscription channel and of the bounded replay
-// history.
+// Bus is an in-process event bus. It fans every event out to all matching
+// subscriptions and is the single communication mechanism between modules.
 //
-// Delivery: Send enqueues into each matching subscription without waiting for a
-// reader, and a subscriber can only overflow its own ring. A buffered subscription
-// never blocks Send. A rendezvous (cap-0) subscription synchronizes briefly with its
-// delivery goroutine on each send, so a stalled reader is dropped rather than queued.
+// Each subscription has its own buffer, and Send never waits for a reader. A
+// buffered subscription drops its oldest event when full; an unbuffered one
+// drops events a stalled consumer cannot keep up with. A slow subscriber can
+// only overflow its own subscription. See [WithBacklog] and [WithReplayBuffer].
 type Bus struct {
 	cfg busConfig
 
@@ -38,7 +37,7 @@ type Bus struct {
 	histLen  int
 }
 
-// NewBus creates a Bus.
+// NewBus creates a Bus with a bounded replay history; see [WithReplayBuffer].
 func NewBus(opts ...BusOption) (*Bus, error) {
 	cfg := busConfig{log: discardLogger(), replayBuffer: defaultHistoryCap}
 	for _, opt := range opts {
@@ -59,15 +58,17 @@ func NewBus(opts ...BusOption) (*Bus, error) {
 	return b, nil
 }
 
-// Subscribe creates a subscription and returns its receive-only channel. The Bus
-// owns the channel: it is the only writer and the only closer.
+// Subscribe registers a subscription under id and returns its receive-only
+// channel. The Bus owns the channel: it is the only writer and the only closer,
+// so a consumer can read it until [Bus.Close] or [Bus.Unsubscribe].
 //
-// If a replay history is configured, Subscribe atomically seeds the subscription
-// with the matching recent events (bounded by WithBacklog) and then registers it for
-// live delivery, so there is no gap and no duplicate at the seam.
+// The channel buffers up to the [WithBacklog] size, 0 by default. A buffered
+// subscription created after events have already been sent is first seeded with
+// matching history, capped by the backlog, so a late subscriber can catch up; an
+// unbuffered subscription is never seeded. See [WithReplayBuffer].
 //
-// id identifies the subscription and is also the value the sender-skip check
-// compares against Event.Source.
+// id identifies the subscription and is the value [Publisher.Send] compares
+// against [Event.Source] to skip a publisher's own subscription.
 func (b *Bus) Subscribe(id string, opts ...SubOption) (<-chan Event, error) {
 	if b == nil {
 		return nil, errNilBus
@@ -103,8 +104,8 @@ func (b *Bus) Subscribe(id string, opts ...SubOption) (<-chan Event, error) {
 	return ch, nil
 }
 
-// Unsubscribe tears the subscription down and closes its channel. It is safe to call
-// more than once.
+// Unsubscribe removes the subscription with id and closes its channel. Events
+// already buffered remain readable. It is safe to call more than once.
 func (b *Bus) Unsubscribe(id string) {
 	if b == nil {
 		return
@@ -119,8 +120,9 @@ func (b *Bus) Unsubscribe(id string) {
 	s.teardown()
 }
 
-// Close tears down every subscription and closes its channel. It is safe to call
-// more than once and is intended for shutdown and tests.
+// Close tears down every subscription and closes its channels. Events already
+// buffered remain readable. It is safe to call more than once and is intended
+// for shutdown and tests.
 func (b *Bus) Close() {
 	if b == nil {
 		return
@@ -148,8 +150,9 @@ func (s *subscription) teardown() {
 	close(s.ch)
 }
 
-// Publisher returns a bound Publisher for id. Send sets Event.Source to id and skips
-// the subscription with the same id. A nil Bus yields a nil Publisher.
+// Publisher returns a Publisher bound to id. Send stamps [Event.Source] with id
+// and skips the subscription with the same id, so a module does not receive its
+// own events. A nil Bus yields a nil Publisher.
 func (b *Bus) Publisher(id string) *Publisher {
 	if b == nil {
 		return nil
@@ -324,18 +327,17 @@ func (s *subscription) nextRendezvous() (Event, chan struct{}, bool) {
 	}
 }
 
-// Publisher sends events on behalf of a single module. The Bus creates it via
-// Bus.Publisher and binds the id, so Event.Source is set by the Bus rather than by
-// the caller. Any holder of the Bus may ask for a Publisher under any id; the kernel
-// only trusts sources it has registered.
+// Publisher sends events on behalf of a single id. The Bus creates it via
+// [Bus.Publisher], which binds the id so [Event.Source] is set by the Bus rather
+// than by the caller.
 type Publisher struct {
 	bus *Bus
 	id  string
 }
 
-// Send delivers e to every subscription except the publisher's own. The caller's
-// context only gates the send; a canceled context surfaces as an error. Filters run
-// outside the bus lock.
+// Send delivers e to every subscription except the publisher's own. If ctx is
+// already canceled, Send returns an error and delivers nothing; otherwise
+// delivery does not block on slow subscribers.
 func (p *Publisher) Send(ctx context.Context, e Event) error {
 	if p == nil || p.bus == nil {
 		return errBusNotInitialized
@@ -374,11 +376,10 @@ func (p *Publisher) Send(ctx context.Context, e Event) error {
 // BusOption configures a Bus.
 type BusOption func(*busConfig) error
 
-// WithReplayBuffer sets the maximum number of recent events the Bus retains for
-// replay. A buffered subscription (WithBacklog > 0) is seeded with up to its backlog
-// of the most recent matching events before live delivery begins. A positive n sets
-// the bound; the default is 64; n == 0 disables replay; a negative n errors.
-// Rendezvous subscriptions have no ring and are never seeded.
+// WithReplayBuffer sets how many recent events the Bus retains so that a
+// subscription created later can be seeded with matching history. The default is
+// 64; 0 disables replay; a negative n errors. A subscription is seeded up to its
+// [WithBacklog] size, so an unbuffered subscription is never seeded.
 func WithReplayBuffer(n int) BusOption {
 	return func(cfg *busConfig) error {
 		if n < 0 {
@@ -389,8 +390,8 @@ func WithReplayBuffer(n int) BusOption {
 	}
 }
 
-// WithBusLogger sets the logger used for internal diagnostics, currently only
-// panicking event filters.
+// WithBusLogger sets the logger for internal diagnostics, currently only
+// panicking event filters. A nil logger is replaced by a discarding logger.
 func WithBusLogger(l *slog.Logger) BusOption {
 	return func(cfg *busConfig) error {
 		cfg.log = l
@@ -401,9 +402,11 @@ func WithBusLogger(l *slog.Logger) BusOption {
 // SubOption configures a single subscription.
 type SubOption func(*subConfig) error
 
-// WithBacklog sets the subscription's bounded ring size. It also caps how many
-// history events are replayed at subscribe time. The default is 0: a rendezvous
-// subscription with no buffering.
+// WithBacklog sets the subscription's buffer size. A buffered subscription never
+// blocks Send; when it is full, its oldest buffered event is dropped. The default
+// is 0, an unbuffered subscription that drops events under a burst rather than
+// queueing them. WithBacklog also caps how many history events are replayed at
+// subscribe time.
 func WithBacklog(n int) SubOption {
 	return func(cfg *subConfig) error {
 		if n < 0 {
@@ -414,12 +417,12 @@ func WithBacklog(n int) SubOption {
 	}
 }
 
-// WithFilter restricts which events are enqueued and replayed for this subscription.
-// A nil filter accepts everything; a panicking one drops the event and is logged.
-// Keep f pure, non-blocking, and free of Bus or Kernel calls: live delivery runs it
-// outside the bus lock, but subscribe-time replay runs it under that lock and the
-// kernel publishes lifecycle events while holding its state lock, so a filter that
-// blocks or waits for a later lifecycle event can deadlock.
+// WithFilter restricts which events are enqueued and replayed for this
+// subscription. A nil filter accepts everything.
+//
+// Keep f pure, fast, and non-blocking, and do not call the Bus or the Kernel from
+// it: a filter may run while the Bus is locked, so calling back into the Bus can
+// deadlock. A panicking filter drops the event and logs it; see [WithBusLogger].
 func WithFilter(f func(Event) bool) SubOption {
 	return func(cfg *subConfig) error {
 		cfg.filter = f

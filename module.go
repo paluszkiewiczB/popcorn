@@ -6,35 +6,47 @@ import (
 	"slices"
 )
 
-// Module is a self-contained unit of functionality managed by the Kernel.
+// Module is a self-contained unit of functionality managed by the Kernel. The
+// Kernel starts a module only after every dependency's Start has returned, and
+// calls its StopFunc during shutdown.
 type Module interface {
-	// ID is the unique, non-empty identifier of the module. By convention it is the
+	// ID is the module's unique, non-empty identifier. By convention it is the
 	// module's import path. The kernel reserves "kernel" for itself.
 	ID() string
 
-	// Dependencies returns the ids of modules that must be ready before this one
-	// starts. A dependency is ready when its Start returns, for a TaskModule just
-	// like any other module.
+	// Dependencies returns the ids of the modules that must be started before
+	// this one. A dependency is started once its Start returns, for a TaskModule
+	// just like any other module.
 	Dependencies() []string
 
-	// Start initializes the module. A module that wants events subscribes itself
-	// through the injected Bus, for example:
+	// Start initializes the module and returns the StopFunc that the kernel
+	// invokes during shutdown; the StopFunc may be nil.
 	//
-	//	events, err := bus.Subscribe(m.ID(), popcorn.WithBacklog(64), popcorn.WithFilter(f))
+	// A module that consumes events holds the Bus like any other dependency and
+	// subscribes itself:
 	//
-	// Start returns a StopFunc that the kernel invokes during shutdown; the StopFunc
-	// may be nil.
+	//	func (m *Server) Start(ctx context.Context) (popcorn.StopFunc, error) {
+	//		// m holds the *popcorn.Bus it was built with.
+	//		events, err := m.bus.Subscribe(m.ID(), popcorn.WithBacklog(64))
+	//		if err != nil {
+	//			return nil, err
+	//		}
+	//		go m.consume(events)
+	//		return m.stop, nil
+	//	}
+	//
+	// Start should return once its setup is done: every dependent waits for it.
+	// Long-running work belongs in a goroutine that the returned StopFunc can
+	// stop. A Start that blocks delays its dependents; on shutdown the kernel
+	// stops the modules whose Start has returned and does not wait for the rest.
 	Start(ctx context.Context) (StopFunc, error)
 }
 
 // TaskModule is a Module that performs finite work and signals completion.
 //
-// Readiness: TaskModule.Done does not gate dependents; a dependent starts once this
-// module's Start returns, like with any dependency.
-//
-// Exit: the kernel auto-stops once there is at least one TaskModule and all of them
-// are done. When exitWhenIdle is false it also waits for every module to have
-// started.
+// The kernel exits once there is at least one TaskModule and all of them are
+// done; see [WithExitWhenIdle]. Done does not gate dependents: a dependent
+// starts once this module's Start returns, like with any dependency.
 type TaskModule interface {
 	Module
 
@@ -42,15 +54,15 @@ type TaskModule interface {
 	Done() <-chan struct{}
 }
 
-// StartFunc is a function-based Module body.
+// StartFunc is the function form of a module's Start method.
 type StartFunc func(ctx context.Context) (StopFunc, error)
 
-// StopFunc cleans up a module. It receives a fresh shutdown context derived from the
-// run context (values preserved, own deadline).
+// StopFunc cleans up a module. It receives a fresh shutdown context derived from
+// the run context (values preserved, own deadline).
 type StopFunc func(ctx context.Context) error
 
 // StopFuncFromCloser adapts an io.Closer to a StopFunc. It returns nil for a nil
-// closer, so it is safe to write `return popcorn.StopFuncFromCloser(res), nil`.
+// closer, so `return popcorn.StopFuncFromCloser(c), nil` is safe.
 func StopFuncFromCloser(c io.Closer) StopFunc {
 	if c == nil {
 		return nil
@@ -58,21 +70,24 @@ func StopFuncFromCloser(c io.Closer) StopFunc {
 	return func(context.Context) error { return c.Close() }
 }
 
-// ModRecipe is a declarative recipe for building a Module. When Done is non-nil the
-// resulting module also satisfies TaskModule.
+// ModRecipe is a declarative recipe for building a Module with [NewModule].
 //
-// NewModule returns the Module interface rather than a concrete type because the
-// concrete implementation depends on whether Done is set. Event-consuming modules
-// subscribe through the injected Bus inside Start and need no special interface.
+// When Done is non-nil the resulting module is also a [TaskModule].
 type ModRecipe struct {
-	ID           string
+	// ID is the module's unique, non-empty identifier. "kernel" is reserved.
+	ID string
+	// Dependencies lists the ids of the modules that must start before this one.
 	Dependencies []string
-	Start        StartFunc
-	Done         <-chan struct{} // optional; makes the module a TaskModule
+	// Start initializes the module and returns the StopFunc invoked on shutdown.
+	Start StartFunc
+	// Done, when non-nil, makes the module a TaskModule; it must be closed when
+	// the module's work is finished.
+	Done <-chan struct{}
 }
 
-// NewModule builds a Module from a recipe, applying the same validation as the
-// kernel (non-empty, non-reserved id, non-nil Start, defensive copy of dependencies).
+// NewModule builds a Module from a recipe. It rejects an empty or reserved ID
+// ([ErrModuleIDNotSet], [ErrModuleIDReserved]) and a missing Start
+// ([ErrModuleStartNotSet]), and copies Dependencies.
 func NewModule(recipe ModRecipe) (Module, error) {
 	if recipe.ID == "" {
 		return nil, ErrModuleIDNotSet

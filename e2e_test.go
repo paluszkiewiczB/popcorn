@@ -160,8 +160,8 @@ func TestE2EFailurePath(t *testing.T) {
 			Cause: errConnectionRefused,
 		})))
 
-		var unhealthy popcorn.KernelUnhealthyError
-		is.True(errors.As(<-done, &unhealthy))
+		unhealthy, ok := errors.AsType[popcorn.KernelUnhealthyError](<-done)
+		is.True(ok)
 		is.Equal(unhealthy.ModuleID, "failing")
 
 		select {

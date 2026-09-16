@@ -26,11 +26,16 @@ var (
 	ErrModuleStartNotSet = errors.New("start function not set for module")
 	// ErrKernelStarted is returned by Start when called on an already-started kernel.
 	ErrKernelStarted = errors.New("kernel already started")
-	// ErrKernelStopped is returned (wrapped) by Start on a graceful shutdown.
+	// ErrKernelStopped is returned (wrapped) by Start after a graceful stop.
 	ErrKernelStopped = errors.New("kernel stopped")
 )
 
-// KernelUnhealthyError is returned by Kernel.Start when a module reports NOK.
+// KernelUnhealthyError is returned by Kernel.Start when a registered module
+// reports [ModuleStateNOK]. Match it with errors.AsType:
+//
+//	if unhealthy, ok := errors.AsType[popcorn.KernelUnhealthyError](err); ok {
+//		// unhealthy.ModuleID, unhealthy.Cause
+//	}
 type KernelUnhealthyError struct {
 	// ModuleID is the module that reported the unhealthy state.
 	ModuleID string

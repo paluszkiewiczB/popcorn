@@ -1,13 +1,21 @@
 # popcorn
 
-Popcorn is a microframework following the micro kernel architecture.
+Popcorn is a microframework for building modular Go applications following the
+microkernel architecture. The core knows nothing about what your application
+does: it handles bootstrap, dependency-ordered startup, health watching, and
+graceful shutdown, while modules hold the functionality and communicate over an
+in-process event bus.
 
-Its core takes care of a proper bootstrap and shutdown of your application, and does not care about functionality of your app.
+## Install
 
-It does not matter whether you're going to have the HTTP server or CLI tool.
+```sh
+go get github.com/paluszkiewiczB/popcorn
+```
 
-Popcorn Modules are ment to be self-containing plugins, which could depend on each other (without circular dependencies!).
+## Documentation
 
-Popcorn Core exposes its current state (liveness, readiness) through the probes and events, which could be consumed by your Module.
+- API reference and runnable examples:
+  [pkg.go.dev/github.com/paluszkiewiczB/popcorn](https://pkg.go.dev/github.com/paluszkiewiczB/popcorn)
+- Architecture and contribution notes: [CONTRIBUTING.md](./CONTRIBUTING.md)
 
-Popcorn Events can also be used as an asynchronous communication mechanism between Modules.
+Popcorn has no runtime dependencies beyond the standard library.

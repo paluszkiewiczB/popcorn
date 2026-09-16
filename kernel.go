@@ -24,11 +24,12 @@ var (
 	errHealthGone  = errors.New("kernel health stream closed")
 )
 
-// Kernel manages the lifecycle of a set of Modules. It is single-shot: calling Start
-// more than once returns ErrKernelStarted.
+// Kernel manages the lifecycle of a set of Modules. It starts modules in
+// dependency order, publishes lifecycle events on the Bus, watches module
+// health, and shuts everything down when the context is canceled, a module
+// reports NOK, or all tasks finish.
 //
-// The Kernel owns no event channels. It publishes lifecycle events through a bound
-// Publisher and subscribes to ModuleStateChanged for health, best-effort.
+// A Kernel runs once: after Start returns, it cannot be started again.
 type Kernel struct {
 	cfg kernelConfig
 
@@ -36,8 +37,9 @@ type Kernel struct {
 	started bool
 }
 
-// NewKernel creates a Kernel. It validates modules, resolves the dependency graph,
-// and rejects cycles.
+// NewKernel creates a Kernel from the given options. It rejects an invalid
+// module set before Start is called: empty, duplicate, or reserved ids, nil
+// modules, and unknown, self, duplicate, or circular dependencies.
 func NewKernel(opts ...KernelOption) (*Kernel, error) {
 	k := &Kernel{cfg: kernelConfig{
 		stopTimeout: defaultStopTime,
@@ -54,13 +56,15 @@ func NewKernel(opts ...KernelOption) (*Kernel, error) {
 	return k, nil
 }
 
-// Start starts modules in dependency order and blocks until the context is canceled,
-// a module reports NOK, or the kernel becomes idle. A module becomes startable once
-// every dependency's Start has returned.
+// Start starts modules in dependency order and blocks until ctx is canceled, a
+// module fails to start, a module reports NOK, or the kernel becomes idle. A
+// module starts once every dependency's Start has returned.
 //
-// It returns ErrKernelStopped (wrapped) on a graceful stop, KernelUnhealthyError when
-// a module reported NOK, or the joined shutdown errors. Start is single-shot: a call
-// that fails during setup still consumes the Kernel.
+// It returns a wrapped [ErrKernelStopped] after a graceful stop, a
+// [KernelUnhealthyError] when a registered module reported NOK, the error from a
+// module's Start when it fails, or the joined errors from shutdown. Start may be
+// called only once: a later call returns [ErrKernelStarted], even if the first
+// call failed during setup.
 func (k *Kernel) Start(ctx context.Context) error {
 	if !k.begin() {
 		return ErrKernelStarted
@@ -655,7 +659,9 @@ func (run *kernelRun) failHalt() {
 // KernelOption configures a Kernel.
 type KernelOption func(*kernelConfig) error
 
-// WithBus sets the event bus. When omitted, the kernel creates one.
+// WithBus sets the Bus the kernel publishes on and subscribes to. When omitted,
+// the kernel creates a Bus and closes it on shutdown; a Bus supplied here is not
+// closed by the kernel, so the caller owns its teardown.
 func WithBus(b *Bus) KernelOption {
 	return func(cfg *kernelConfig) error {
 		cfg.bus = b
@@ -663,8 +669,8 @@ func WithBus(b *Bus) KernelOption {
 	}
 }
 
-// WithLogger sets the logger used by the bus the kernel creates when no bus is
-// supplied via WithBus. An injected bus keeps its own logger.
+// WithLogger sets the logger for the Bus the kernel creates when no Bus is
+// supplied with [WithBus]. A supplied Bus keeps its own logger.
 func WithLogger(l *slog.Logger) KernelOption {
 	return func(cfg *kernelConfig) error {
 		cfg.log = l
@@ -672,7 +678,7 @@ func WithLogger(l *slog.Logger) KernelOption {
 	}
 }
 
-// WithModules registers modules.
+// WithModules registers the modules the kernel runs. Repeated calls accumulate.
 func WithModules(modules ...Module) KernelOption {
 	return func(cfg *kernelConfig) error {
 		cfg.modules = append(cfg.modules, modules...)
@@ -680,7 +686,9 @@ func WithModules(modules ...Module) KernelOption {
 	}
 }
 
-// WithHealthTick sets the health polling interval.
+// WithHealthTick sets how often the kernel re-drains queued health events, in
+// addition to handling them as they arrive. The default is 0, which disables
+// the periodic re-check.
 func WithHealthTick(d time.Duration) KernelOption {
 	return func(cfg *kernelConfig) error {
 		if d < 0 {
@@ -691,8 +699,9 @@ func WithHealthTick(d time.Duration) KernelOption {
 	}
 }
 
-// WithStopTimeout sets the overall shutdown budget. Each module's StopFunc gets a
-// context carved out of this budget.
+// WithStopTimeout sets the total shutdown budget shared by all module StopFuncs.
+// Each StopFunc receives a context carved out of this budget. The default is 5
+// seconds.
 func WithStopTimeout(d time.Duration) KernelOption {
 	return func(cfg *kernelConfig) error {
 		if d < 0 {
@@ -704,9 +713,10 @@ func WithStopTimeout(d time.Duration) KernelOption {
 }
 
 // WithParallelism caps how many modules start concurrently, and how many stop
-// concurrently within a wave. 1 is sequential; 0 means no cap. Stops always run in
-// descending dependency-depth waves: every dependent is stopped before anything it
-// depends on, while modules at the same depth stop concurrently.
+// concurrently within a wave. 1 is sequential; 0 (the default) means no cap.
+// Stops always run in descending dependency-depth waves: every dependent is
+// stopped before anything it depends on, while modules at the same depth stop
+// concurrently.
 func WithParallelism(p int) KernelOption {
 	return func(cfg *kernelConfig) error {
 		if p < 0 {
@@ -717,10 +727,11 @@ func WithParallelism(p int) KernelOption {
 	}
 }
 
-// WithExitWhenIdle controls auto-shutdown. The kernel stops once there is at least
-// one TaskModule and every TaskModule is done. When true this happens even while
-// long-running peers are still up. When false (default) the kernel additionally
-// waits until every module has started, so a graph still coming up is not cut short.
+// WithExitWhenIdle controls auto-shutdown. The kernel stops once there is at
+// least one TaskModule and every TaskModule is done. When true, this happens even
+// while long-running peers are still up. When false (the default), the kernel
+// additionally waits until every module has started, so a graph still coming up
+// is not cut short.
 func WithExitWhenIdle(v bool) KernelOption {
 	return func(cfg *kernelConfig) error {
 		cfg.exitWhenIdle = v

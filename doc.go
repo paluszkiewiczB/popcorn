@@ -116,10 +116,14 @@
 //
 // [Kernel.Start] returns:
 //
-//   - [ErrKernelStopped] (wrapped) after a graceful stop,
+//   - [ErrKernelStopped] (wrapped) after a graceful stop, whether ctx was
+//     canceled or the kernel became idle,
 //   - a [KernelUnhealthyError] when a module reported NOK,
 //   - the error returned by a module's Start, when a module fails to start,
 //   - the joined errors from module StopFuncs, if any.
+//
+// A canceled stop also matches context.Canceled or context.DeadlineExceeded
+// through [errors.Is], so the cause stays inspectable alongside the sentinel.
 //
 // Classify the result with [errors.Is] and [errors.AsType]:
 //

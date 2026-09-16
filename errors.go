@@ -26,7 +26,9 @@ var (
 	ErrModuleStartNotSet = errors.New("start function not set for module")
 	// ErrKernelStarted is returned by Start when called on an already-started kernel.
 	ErrKernelStarted = errors.New("kernel already started")
-	// ErrKernelStopped is returned (wrapped) by Start after a graceful stop.
+	// ErrKernelStopped is returned (wrapped) by Start after a graceful stop:
+	// either the caller's context was canceled or the kernel became idle.
+	// A canceled stop also matches context.Canceled via errors.Is.
 	ErrKernelStopped = errors.New("kernel stopped")
 )
 

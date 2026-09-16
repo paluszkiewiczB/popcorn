@@ -78,6 +78,54 @@ func Example() {
 	// true
 }
 
+// ExampleKernel_Start_canceled shows the primary shutdown path: the caller's
+// context is canceled, as it is by signal.NotifyContext. The stop is graceful,
+// so Start reports ErrKernelStopped while the context error stays inspectable.
+func ExampleKernel_Start_canceled() {
+	bus, err := popcorn.NewBus()
+	if err != nil {
+		fmt.Println("bus:", err)
+		return
+	}
+	defer bus.Close()
+
+	started := make(chan struct{})
+	server, err := popcorn.NewModule(popcorn.ModRecipe{
+		ID: "server",
+		Start: func(context.Context) (popcorn.StopFunc, error) {
+			close(started)
+			return func(context.Context) error { return nil }, nil
+		},
+	})
+	if err != nil {
+		fmt.Println("module:", err)
+		return
+	}
+
+	k, err := popcorn.NewKernel(popcorn.WithBus(bus), popcorn.WithModules(server))
+	if err != nil {
+		fmt.Println("kernel:", err)
+		return
+	}
+
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+
+	done := make(chan error, 1)
+	go func() { done <- k.Start(ctx) }()
+
+	<-started // the kernel is up, so cancel is a clean shutdown
+	cancel()
+	err = <-done
+
+	fmt.Println(errors.Is(err, popcorn.ErrKernelStopped))
+	fmt.Println(errors.Is(err, context.Canceled))
+
+	// Output:
+	// true
+	// true
+}
+
 // ExampleBus_Subscribe subscribes with a backlog and a filter, so the
 // subscription buffers matching events and ignores the rest.
 func ExampleBus_Subscribe() {

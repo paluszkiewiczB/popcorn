@@ -60,11 +60,13 @@ func NewKernel(opts ...KernelOption) (*Kernel, error) {
 // module fails to start, a module reports NOK, or the kernel becomes idle. A
 // module starts once every dependency's Start has returned.
 //
-// It returns a wrapped [ErrKernelStopped] after a graceful stop, a
-// [KernelUnhealthyError] when a registered module reported NOK, the error from a
-// module's Start when it fails, or the joined errors from shutdown. Start may be
-// called only once: a later call returns [ErrKernelStarted], even if the first
-// call failed during setup.
+// It returns a wrapped [ErrKernelStopped] after a graceful stop, whether ctx
+// was canceled or the kernel became idle, a [KernelUnhealthyError] when a
+// registered module reported NOK, the error from a module's Start when it fails,
+// or the joined errors from shutdown. A canceled stop also matches
+// [context.Canceled] (or [context.DeadlineExceeded]) through [errors.Is], so the
+// cause stays inspectable. Start may be called only once: a later call returns
+// [ErrKernelStarted], even if the first call failed during setup.
 func (k *Kernel) Start(ctx context.Context) error {
 	if !k.begin() {
 		return ErrKernelStarted
@@ -467,7 +469,8 @@ func (run *kernelRun) loop(ctx context.Context) error {
 func (run *kernelRun) handleEvent(ctx context.Context, event loopEvent, payload Event, err error) (bool, error) {
 	switch event {
 	case eventCanceled:
-		return false, errors.Join(append(run.shutdown(ctx, err), err)...)
+		return false, errors.Join(append(run.shutdown(ctx, err), err,
+			fmt.Errorf("kernel stopped: %w", ErrKernelStopped))...)
 	case eventFailed:
 		return false, run.finish(ctx, err)
 	case eventHealth:

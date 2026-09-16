@@ -371,7 +371,9 @@ func TestKernelLifecycle(t *testing.T) {
 			time.Sleep(5 * time.Millisecond) // let several health ticks fire
 			cancel()
 
-			is.True(errors.Is(<-done, context.Canceled)) // a canceled run returns the context error
+			err = <-done
+			is.True(errors.Is(err, context.Canceled))         // a canceled run returns the context error
+			is.True(errors.Is(err, popcorn.ErrKernelStopped)) // and is reported as a graceful stop
 		})
 	})
 }
@@ -637,7 +639,8 @@ func TestKernelFailures(t *testing.T) {
 
 			select {
 			case err := <-stopped:
-				is.True(errors.Is(err, context.Canceled)) // ctx cancel must surface as the context error
+				is.True(errors.Is(err, context.Canceled))         // ctx cancel must surface as the context error
+				is.True(errors.Is(err, popcorn.ErrKernelStopped)) // a canceled stop is still a graceful stop
 			case <-time.After(never):
 				is.Fail() // kernel did not stop after ctx cancel
 			}

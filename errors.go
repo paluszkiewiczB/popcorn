@@ -48,22 +48,3 @@ func (e KernelUnhealthyError) Error() string {
 
 // Unwrap returns the cause.
 func (e KernelUnhealthyError) Unwrap() error { return e.Cause }
-
-// causeError preserves the health cause for errors.Is and errors.As while also
-// matching by message. The contract compares the reported cause against an
-// independently constructed error with the same text, so message equality is
-// deliberate here, not incidental.
-type causeError struct{ err error }
-
-func (w causeError) Error() string { return w.err.Error() }
-func (w causeError) Unwrap() error { return w.err }
-func (w causeError) Is(target error) bool {
-	return target != nil && target.Error() == w.err.Error()
-}
-
-func wrapCause(cause error) error {
-	if cause == nil {
-		return nil
-	}
-	return causeError{err: cause}
-}

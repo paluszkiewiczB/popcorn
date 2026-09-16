@@ -9,25 +9,15 @@ import (
 	"time"
 
 	"github.com/matryer/is"
-	popcorn "github.com/paluszkiewiczB/popcorn"
+	"github.com/paluszkiewiczB/popcorn"
 )
 
 // The hermetic end-to-end contracts: whole-system behavior inside one
 // process - no network, no example code.
-func Test_E2E(t *testing.T) {
+
+func TestE2EPingStory(t *testing.T) {
 	t.Parallel()
-	synctest.Test(t, testE2E)
-}
-
-func testE2E(test *testing.T) {
-	testPingStory(test)
-	testFailurePath(test)
-}
-
-func testPingStory(t *testing.T) {
-	t.Helper()
-	step(t, "ping story", func(t *testing.T) {
-		t.Helper()
+	synctest.Test(t, func(t *testing.T) {
 		is := is.New(t)
 
 		b := newBus(t, popcorn.WithReplayBuffer(8))
@@ -72,10 +62,12 @@ func testPingStory(t *testing.T) {
 
 			go func() {
 				var got []int
-				for len(got) < rounds {
-					e := <-ch
+				for e := range ch {
 					if tk, ok := e.Payload.(tick); ok {
 						got = append(got, tk.N)
+						if len(got) == rounds {
+							break
+						}
 					}
 				}
 				close(collectorDone)
@@ -121,11 +113,9 @@ func testPingStory(t *testing.T) {
 	})
 }
 
-func testFailurePath(t *testing.T) {
-	t.Helper()
-	step(t, "failure path", func(t *testing.T) {
-		t.Helper()
-
+func TestE2EFailurePath(t *testing.T) {
+	t.Parallel()
+	synctest.Test(t, func(t *testing.T) {
 		is := is.New(t)
 
 		b := newBus(t, popcorn.WithReplayBuffer(8))

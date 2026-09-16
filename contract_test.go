@@ -1,19 +1,15 @@
 package popcorn_test
 
 // The contract kit: shared helpers for black-box tests of the popcorn API.
-//
-// Implementation is contract-driven — these files are written against
-// api.go's documented behavior while every body still panics
-// ("not implemented"). The suite is expected to be red at this point.
 
 import (
 	"context"
 	"errors"
-	"testing"
+	"testing/synctest"
 	"time"
 
 	"github.com/matryer/is"
-	popcorn "github.com/paluszkiewiczB/popcorn"
+	"github.com/paluszkiewiczB/popcorn"
 )
 
 // never is the watchdog for every blocking expectation: if the API under
@@ -25,7 +21,6 @@ var (
 	errBoom              = errors.New("boom")
 	errConnectionRefused = errors.New("connection refused")
 	errDiskFull          = errors.New("disk full")
-	errDiskFullCheck     = errors.New("disk full") // distinct value with the same message
 	errPortInUse         = errors.New("port in use")
 	errSpoof             = errors.New("spoof")
 )
@@ -53,11 +48,8 @@ func within() (context.Context, context.CancelFunc) {
 func mustRecv(is *is.I, ch <-chan popcorn.Event) popcorn.Event {
 	is.Helper()
 
-	c := make(chan popcorn.Event, 1)
-	go func() { c <- <-ch }()
-
 	select {
-	case e := <-c:
+	case e := <-ch:
 		return e
 	case <-time.After(never):
 		is.Fail() // timed out waiting for an event
@@ -65,36 +57,26 @@ func mustRecv(is *is.I, ch <-chan popcorn.Event) popcorn.Event {
 	}
 }
 
-// drained reads until ch stays empty for a short quiescence window and returns
-// the accumulated events. Used to assert exact delivery sets without racing.
+// drained collects everything the subscription can still deliver once every
+// producer has settled. It must be called inside a synctest bubble, where Wait
+// returns only when the rest of the bubble is durably blocked, making the drain
+// exact rather than a quiescence guess.
 func drained(is *is.I, ch <-chan popcorn.Event) []popcorn.Event {
 	is.Helper()
 
 	var out []popcorn.Event
-	quiesce := 200 * time.Millisecond
 	for {
+		synctest.Wait()
 		select {
 		case e := <-ch:
 			out = append(out, e)
-			quiesce = 200 * time.Millisecond
-		case <-time.After(quiesce):
+		default:
 			return out
 		}
 	}
 }
 
-// step runs a named test step inline. A synctest bubble forbids t.Run, so the
-// timing-sensitive suites use this runner instead of subtests; the assertion
-// file:line still pinpoints failures.
-func step(t *testing.T, name string, f func(*testing.T)) {
-	t.Helper()
-	t.Log("== " + name)
-	f(t)
-}
-
 // recipe returns a valid Module recipe with the given id.
 func recipe(id string, start func(ctx context.Context) (popcorn.StopFunc, error)) *popcorn.ModRecipe {
-	return &popcorn.ModRecipe{ID: id, Start: func(ctx context.Context) (popcorn.StopFunc, error) {
-		return start(ctx)
-	}}
+	return &popcorn.ModRecipe{ID: id, Start: start}
 }

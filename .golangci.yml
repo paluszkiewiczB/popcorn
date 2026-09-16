@@ -3,6 +3,9 @@ version: "2"
 linters:
   default: all
   disable:
+    # The deprecated exhaustruct/gomodguard aliases are off; their current
+    # replacements (exhaustruct_v5, gomodguard_v2) stay enabled and configured
+    # under settings. wsl is off under both names.
     - depguard
     - exhaustruct
     - gomodguard
@@ -14,6 +17,13 @@ linters:
     - wsl_v5
     - whitespace
   settings:
+    # Framework and fixture types are built field-by-field (Event{}, internal
+    # state, option structs), so partial literals are intentional here. The
+    # linter still guards every other struct.
+    exhaustruct_v5:
+      ignore-patterns:
+        - .*/popcorn\.(Bus|Event|Kernel|ModRecipe|ModuleStateChanged|busConfig|kernelConfig|kernelRun|moduleRun|subConfig|subscription)$
+        - .*/popcorn_test\.(honest|observation|tick)$
     ireturn:
       # NewModule must return Module: the concrete type depends on whether the
       # recipe carries a Done channel, and callers assert TaskModule from it.
@@ -25,13 +35,14 @@ linters:
         - Module
   exclusions:
     rules:
-      # Test files aggregate many independent scenarios, and synctest bubbles
-      # forbid subtests, so fixture length/complexity limits do not apply.
+      # Test files aggregate many independent scenarios, so fixture
+      # length/complexity limits do not apply.
       - path: _test\.go
         linters:
           - cyclop
           - funlen
           - gocognit
+          - maintidx
 formatters:
   enable:
     - gofumpt

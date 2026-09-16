@@ -5,25 +5,19 @@ import (
 	"errors"
 	"fmt"
 	"log/slog"
-	"runtime"
 	"slices"
 	"sync"
 )
 
 const defaultHistoryCap = 1024
 
-// bufferDrainTries bounds how many scheduling yields a full buffered ring attempts
-// before it gives up and evicts the oldest event. It lets an already-runnable reader
-// catch up without letting a genuinely slow subscriber stall Send.
-const bufferDrainTries = 4
-
 var (
-	errNilBus             = errors.New("popcorn: nil bus")
-	errSubscriptionID     = errors.New("popcorn: subscription id not set")
-	errSubscriptionExists = errors.New("popcorn: subscription already registered")
-	errBusNotInitialized  = errors.New("popcorn: bus not initialized")
-	errReplayBuffer       = errors.New("popcorn: replay buffer must not be negative")
-	errBacklog            = errors.New("popcorn: backlog must not be negative")
+	errNilBus             = errors.New("nil bus")
+	errSubscriptionID     = errors.New("subscription id not set")
+	errSubscriptionExists = errors.New("subscription already registered")
+	errBusNotInitialized  = errors.New("publisher is not bound to a bus")
+	errReplayBuffer       = errors.New("replay buffer must not be negative")
+	errBacklog            = errors.New("backlog must not be negative")
 )
 
 // Bus is an in-process event bus with per-subscription, bounded, isolated delivery.
@@ -49,6 +43,9 @@ func NewBus(opts ...BusOption) (*Bus, error) {
 		if err := opt(&cfg); err != nil {
 			return nil, err
 		}
+	}
+	if cfg.log == nil {
+		cfg.log = discardLogger()
 	}
 	return &Bus{
 		cfg:  cfg,
@@ -86,7 +83,7 @@ func (b *Bus) Subscribe(id string, opts ...SubOption) (<-chan Event, error) {
 	}
 
 	ch := make(chan Event, cfg.backlog)
-	s := &subscription{id: id, ch: ch, filter: cfg.filter, backlog: cfg.backlog}
+	s := &subscription{id: id, ch: ch, filter: guardFilter(cfg.filter, b.cfg.log)}
 	if cfg.backlog == 0 {
 		s.handoff = make(chan Event)
 		s.abort = make(chan struct{})
@@ -130,10 +127,9 @@ func (b *Bus) Close() {
 	}
 }
 
-// teardown stops the delivery goroutine (if any) and closes the subscription channel.
-// The caller must hold b.mu so that no Send can be enqueuing concurrently.
+// Caller must hold b.mu so no Send can be enqueuing concurrently.
 func (s *subscription) teardown() {
-	if s.backlog == 0 {
+	if s.unbuffered() {
 		s.mu.Lock()
 		if !s.closed {
 			s.closed = true
@@ -155,15 +151,14 @@ func (b *Bus) Publisher(id string) *Publisher {
 	return &Publisher{bus: b, id: id}
 }
 
-// seed replays the matching recent history into a new buffered subscription, oldest
-// first. Rendezvous subscriptions have no ring to seed.
 func (b *Bus) seed(s *subscription) {
-	if s.backlog == 0 {
+	if s.unbuffered() {
 		return
 	}
-	matched := make([]Event, 0, s.backlog)
+	backlog := cap(s.ch)
+	matched := make([]Event, 0, backlog)
 	for _, e := range slices.Backward(b.history) {
-		if len(matched) >= s.backlog {
+		if len(matched) >= backlog {
 			break
 		}
 		if s.filter == nil || s.filter(e) {
@@ -194,46 +189,31 @@ func (b *Bus) remember(e Event) {
 }
 
 func (s *subscription) offer(e Event) {
-	if s.backlog == 0 {
+	if s.unbuffered() {
 		s.offerRendezvous(e)
 		return
 	}
 	s.offerBuffered(e)
 }
 
-// offerBuffered implements drop-oldest delivery into a buffered subscription ring.
-// The Bus is the only writer. When the ring is full it first gives an active reader
-// a chance to drain (a bounded, non-blocking yield); only then does it evict the
-// oldest event to make room, so Send still never stalls.
+func (s *subscription) unbuffered() bool { return cap(s.ch) == 0 }
+
+// The Bus is the only writer, so a full ring always has room after one eviction.
 func (s *subscription) offerBuffered(e Event) {
 	select {
 	case s.ch <- e:
 		return
 	default:
 	}
-	for range bufferDrainTries {
-		runtime.Gosched()
-		select {
-		case s.ch <- e:
-			return
-		default:
-		}
-	}
-	// Ring is full and the reader is not keeping up: evict exactly one oldest event.
 	select {
 	case <-s.ch:
 	default:
 	}
-	select {
-	case s.ch <- e:
-	case <-s.done:
-	}
+	s.ch <- e
 }
 
-// offerRendezvous enqueues into a rendezvous subscription. A cap-0 subscription has
-// no ring: it holds at most the event the delivery goroutine is handing off plus one
-// queued event. A third pending event means the reader is not keeping up, so the
-// in-flight hand-off is aborted and the subscription sheds until a reader catches up.
+// Holds at most one queued event next to the in-flight hand-off. A third pending
+// event aborts the hand-off and sheds until a reader catches up.
 func (s *subscription) offerRendezvous(e Event) {
 	s.mu.Lock()
 	if s.closed {
@@ -241,9 +221,8 @@ func (s *subscription) offerRendezvous(e Event) {
 		return
 	}
 	if len(s.inbox) == 0 && s.waiting && !s.handoffClaimed {
-		// The delivery goroutine is idle and waiting for work: hand the event
-		// over synchronously so a following send finds the inbox empty. The
-		// claim flag keeps a second send from racing the receiver's reset.
+		// The delivery goroutine is idle: hand over synchronously. The claim flag
+		// keeps a second send from racing the receiver's reset.
 		s.waiting = false
 		s.handoffClaimed = true
 		s.mu.Unlock()
@@ -253,14 +232,8 @@ func (s *subscription) offerRendezvous(e Event) {
 		}
 		return
 	}
-	if s.shedding {
-		// A reader fell behind: drop rather than queue behind the in-flight
-		// event so a burst cannot accumulate.
-		s.mu.Unlock()
-		return
-	}
 	if len(s.inbox) > 0 {
-		s.shed = true
+		s.shedding = true
 		s.abortLocked()
 	}
 	s.inbox = append(s.inbox[:0], e)
@@ -277,19 +250,12 @@ func (s *subscription) abortLocked() {
 	s.abort = make(chan struct{})
 }
 
-// cap0Loop moves queued events to the subscription channel. It blocks on the
-// channel until a reader arrives. A write that overflows the single-slot inbox
-// aborts the in-flight hand-off, and the subscription then sheds events without
-// blocking until a reader shows up again.
 func (s *subscription) cap0Loop() {
 	defer close(s.stopped)
 	for {
-		e, abort, force, ok := s.nextRendezvous()
+		e, abort, ok := s.nextRendezvous()
 		if !ok {
 			return
-		}
-		if force {
-			s.setShedding(true)
 		}
 		if s.isShedding() {
 			select {
@@ -309,8 +275,7 @@ func (s *subscription) cap0Loop() {
 	}
 }
 
-// setShedding records shed mode. Leaving shed mode also discards any queued event,
-// which belongs to the burst the reader fell behind on.
+// Discards the queued event too; it belongs to the burst the reader fell behind on.
 func (s *subscription) setShedding(v bool) {
 	s.mu.Lock()
 	s.shedding = v
@@ -326,22 +291,18 @@ func (s *subscription) isShedding() bool {
 	return s.shedding
 }
 
-// nextRendezvous blocks until there is an event to hand off or the subscription is
-// torn down. The abort channel cancels an in-flight hand-off once a newer event
-// arrives; force reports a pending overflow so the caller enters shedding mode.
-func (s *subscription) nextRendezvous() (Event, chan struct{}, bool, bool) {
+func (s *subscription) nextRendezvous() (Event, chan struct{}, bool) {
 	s.mu.Lock()
 	if len(s.inbox) > 0 {
 		e := s.inbox[0]
 		s.inbox = s.inbox[:0]
-		abort, force := s.abort, s.shed
-		s.shed = false
+		abort := s.abort
 		s.mu.Unlock()
-		return e, abort, force, true
+		return e, abort, true
 	}
 	if s.closed {
 		s.mu.Unlock()
-		return Event{}, nil, false, false
+		return Event{}, nil, false
 	}
 	s.waiting = true
 	s.mu.Unlock()
@@ -351,12 +312,11 @@ func (s *subscription) nextRendezvous() (Event, chan struct{}, bool, bool) {
 		s.mu.Lock()
 		s.waiting = false
 		s.handoffClaimed = false
-		abort, force := s.abort, s.shed
-		s.shed = false
+		abort := s.abort
 		s.mu.Unlock()
-		return e, abort, force, true
+		return e, abort, true
 	case <-s.done:
-		return Event{}, nil, false, false
+		return Event{}, nil, false
 	}
 }
 
@@ -377,7 +337,7 @@ func (p *Publisher) Send(ctx context.Context, e Event) error {
 		return errBusNotInitialized
 	}
 	if err := ctx.Err(); err != nil {
-		return fmt.Errorf("popcorn: send context: %w", err)
+		return fmt.Errorf("send: %w", err)
 	}
 	e.source = p.id
 
@@ -425,7 +385,8 @@ func WithReplayBuffer(n int) BusOption {
 	}
 }
 
-// WithBusLogger sets the Bus logger.
+// WithBusLogger sets the logger used for internal diagnostics, currently only
+// panicking event filters.
 func WithBusLogger(l *slog.Logger) BusOption {
 	return func(cfg *busConfig) error {
 		cfg.log = l
@@ -450,25 +411,28 @@ func WithBacklog(n int) SubOption {
 }
 
 // WithFilter restricts which events are enqueued and replayed for this subscription.
-// f is panic-recovered; a panic drops the event. A nil filter accepts everything.
+// A nil filter accepts everything; a panicking one drops the event and is logged.
 // Keep f pure, non-blocking, and free of Bus or Kernel calls: live delivery runs it
 // outside the bus lock, but subscribe-time replay runs it under that lock and the
 // kernel publishes lifecycle events while holding its state lock, so a filter that
 // blocks or waits for a later lifecycle event can deadlock.
 func WithFilter(f func(Event) bool) SubOption {
 	return func(cfg *subConfig) error {
-		cfg.filter = guardFilter(f)
+		cfg.filter = f
 		return nil
 	}
 }
 
-func guardFilter(f func(Event) bool) func(Event) bool {
+// guardFilter wraps f so a panicking filter drops the event instead of taking down
+// Send. The panic is logged: it is always a bug in caller code.
+func guardFilter(f func(Event) bool, log *slog.Logger) func(Event) bool {
 	if f == nil {
 		return nil
 	}
 	return func(e Event) (ok bool) {
 		defer func() {
-			if recover() != nil {
+			if r := recover(); r != nil {
+				log.Warn("event filter panicked", "kind", e.Kind, "panic", r)
 				ok = false
 			}
 		}()
@@ -476,7 +440,6 @@ func guardFilter(f func(Event) bool) func(Event) bool {
 	}
 }
 
-// busConfig, subConfig are private option targets.
 type busConfig struct {
 	replayBuffer int
 	log          *slog.Logger
@@ -488,19 +451,17 @@ type subConfig struct {
 }
 
 type subscription struct {
-	id      string
-	ch      chan Event
-	filter  func(Event) bool
-	backlog int
+	id     string
+	ch     chan Event
+	filter func(Event) bool
 
-	// Rendezvous (backlog == 0) delivery state.
+	// Rendezvous (cap-0) delivery state.
 	mu             sync.Mutex
 	inbox          []Event
 	handoff        chan Event
 	waiting        bool
 	handoffClaimed bool
 	shedding       bool
-	shed           bool
 	abort          chan struct{}
 	done           chan struct{}
 	stopped        chan struct{}

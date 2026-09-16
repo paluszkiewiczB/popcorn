@@ -44,8 +44,6 @@ func newEvent(kind string, payload any) Event {
 	return Event{Kind: kind, At: time.Now(), Payload: payload}
 }
 
-// kindOf derives a Kind from a payload value: the type name for named types, the
-// full type string for unnamed ones. It never returns an empty kind.
 func kindOf(payload any) string {
 	t := reflect.TypeOf(payload)
 	if t == nil {

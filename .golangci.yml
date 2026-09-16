@@ -13,6 +13,25 @@ linters:
     - wsl
     - wsl_v5
     - whitespace
+  settings:
+    ireturn:
+      # NewModule must return Module: the concrete type depends on whether the
+      # recipe carries a Done channel, and callers assert TaskModule from it.
+      allow:
+        - anon
+        - error
+        - empty
+        - stdlib
+        - Module
+  exclusions:
+    rules:
+      # Test files aggregate many independent scenarios, and synctest bubbles
+      # forbid subtests, so fixture length/complexity limits do not apply.
+      - path: _test\.go
+        linters:
+          - cyclop
+          - funlen
+          - gocognit
 formatters:
   enable:
     - gofumpt

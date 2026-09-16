@@ -3,6 +3,7 @@ package popcorn_test
 import (
 	"context"
 	"testing"
+	"testing/synctest"
 	"time"
 
 	"github.com/matryer/is"
@@ -14,21 +15,41 @@ import (
 type tick struct{ N int }
 
 func newBus(t *testing.T, opts ...popcorn.BusOption) *popcorn.Bus {
+	t.Helper()
+
 	is := is.New(t)
 	b, err := popcorn.NewBus(opts...)
 	is.NoErr(err) // zero-config bus must be constructible
+	t.Cleanup(b.Close)
 	return b
 }
 
-func Test_Bus(test *testing.T) {
-	test.Run("options", func(t *testing.T) {
-		t.Run("negative replay buffer rejected", func(t *testing.T) {
+func Test_Bus(t *testing.T) {
+	t.Parallel()
+	synctest.Test(t, testBus)
+}
+
+func testBus(test *testing.T) {
+	testBusOptions(test)
+	testBusPublishing(test)
+	testBusFilter(test)
+	testBusReplay(test)
+	testBusMisc(test)
+}
+
+func testBusOptions(t *testing.T) {
+	t.Helper()
+	step(t, "options", func(t *testing.T) {
+		t.Helper()
+		step(t, "negative replay buffer rejected", func(t *testing.T) {
+			t.Helper()
 			is := is.New(t)
 			_, err := popcorn.NewBus(popcorn.WithReplayBuffer(-1))
 			is.True(err != nil) // invalid options must be rejected at construction
 		})
 
-		t.Run("negative backlog rejected", func(t *testing.T) {
+		step(t, "negative backlog rejected", func(t *testing.T) {
+			t.Helper()
 			is := is.New(t)
 
 			b := newBus(t)
@@ -37,17 +58,20 @@ func Test_Bus(test *testing.T) {
 		})
 	})
 
-	test.Run("subscribe validation", func(t *testing.T) {
+	step(t, "subscribe validation", func(t *testing.T) {
+		t.Helper()
 		b := newBus(t)
 
-		t.Run("empty id rejected", func(t *testing.T) {
+		step(t, "empty id rejected", func(t *testing.T) {
+			t.Helper()
 			is := is.New(t)
 
 			_, err := b.Subscribe("")
 			is.True(err != nil) // Subscribe must reject an empty id
 		})
 
-		t.Run("duplicate id rejected", func(t *testing.T) {
+		step(t, "duplicate id rejected", func(t *testing.T) {
+			t.Helper()
 			is := is.New(t)
 
 			ch, err := b.Subscribe("dup")
@@ -59,7 +83,8 @@ func Test_Bus(test *testing.T) {
 		})
 	})
 
-	test.Run("owns and closes channels", func(t *testing.T) {
+	step(t, "owns and closes channels", func(t *testing.T) {
+		t.Helper()
 		is := is.New(t)
 
 		b := newBus(t)
@@ -84,8 +109,12 @@ func Test_Bus(test *testing.T) {
 
 		b.Unsubscribe("owned") // second call must not panic
 	})
+}
 
-	test.Run("publisher stamps the bound source", func(t *testing.T) {
+func testBusPublishing(t *testing.T) {
+	t.Helper()
+	step(t, "publisher stamps the bound source", func(t *testing.T) {
+		t.Helper()
 		is := is.New(t)
 
 		b := newBus(t)
@@ -104,7 +133,8 @@ func Test_Bus(test *testing.T) {
 		is.Equal(got.Payload, tick{N: 1})
 	})
 
-	test.Run("send skips own subscription", func(t *testing.T) {
+	step(t, "send skips own subscription", func(t *testing.T) {
+		t.Helper()
 		is := is.New(t)
 
 		b := newBus(t)
@@ -128,8 +158,10 @@ func Test_Bus(test *testing.T) {
 		}
 	})
 
-	test.Run("backlog ring", func(t *testing.T) {
-		t.Run("slow subscriber overflows only its own ring", func(t *testing.T) {
+	step(t, "backlog ring", func(t *testing.T) {
+		t.Helper()
+		step(t, "slow subscriber overflows only its own ring", func(t *testing.T) {
+			t.Helper()
 			is := is.New(t)
 
 			b := newBus(t)
@@ -154,7 +186,8 @@ func Test_Bus(test *testing.T) {
 			is.Equal(got[1].Payload, tick{N: 5})
 		})
 
-		t.Run("default subscription is unbuffered", func(t *testing.T) {
+		step(t, "default subscription is unbuffered", func(t *testing.T) {
+			t.Helper()
 			is := is.New(t)
 
 			b := newBus(t)
@@ -169,19 +202,27 @@ func Test_Bus(test *testing.T) {
 			is.NoErr(err)
 
 			pub := b.Publisher("p")
-			for i := 0; i < 50; i++ {
+			for i := range 50 {
 				is.NoErr(pub.Send(context.Background(), popcorn.NewEvent(tick{N: i})))
 			}
 
 			// Nobody read during the burst: with no backlog, every event faces
 			// the drop rule; up to one may be in the delivery goroutine's hand.
-			is.True(len(drained(is, slow)) <= 1)                                   // rendezvous must not queue events for unread subscribers
-			is.True(len(drained(is, other)) >= 1 && len(drained(is, other)) <= 50) // other subs still work
+			nSlow := len(drained(is, slow))
+			is.True(nSlow <= 1) // rendezvous must not queue events for unread subscribers
+
+			nOther := len(drained(is, other))
+			is.True(nOther >= 1 && nOther <= 50) // other subs still work
 		})
 	})
+}
 
-	test.Run("filter", func(t *testing.T) {
-		t.Run("keeps matching and drops the rest", func(t *testing.T) {
+func testBusFilter(t *testing.T) {
+	t.Helper()
+	step(t, "filter", func(t *testing.T) {
+		t.Helper()
+		step(t, "keeps matching and drops the rest", func(t *testing.T) {
+			t.Helper()
 			is := is.New(t)
 
 			b := newBus(t)
@@ -198,11 +239,12 @@ func Test_Bus(test *testing.T) {
 
 			got := mustRecv(is, filtered)
 			is.Equal(got.Payload, tick{N: 1})         // filter must keep matching events
-			is.True(len(drained(is, filtered)) == 1)  // ...and drop non-matching ones
+			is.True(len(drained(is, filtered)) == 0)  // ...and drop non-matching ones
 			is.True(len(drained(is, strangers)) == 2) // unfiltered subscription sees both
 		})
 
-		t.Run("nil filter allows all", func(t *testing.T) {
+		step(t, "nil filter allows all", func(t *testing.T) {
+			t.Helper()
 			is := is.New(t)
 
 			b := newBus(t)
@@ -216,7 +258,8 @@ func Test_Bus(test *testing.T) {
 			is.True(len(drained(is, permissive)) == 2) // a nil filter accepts everything
 		})
 
-		t.Run("panicking filter is recovered", func(t *testing.T) {
+		step(t, "panicking filter is recovered", func(t *testing.T) {
+			t.Helper()
 			is := is.New(t)
 
 			b := newBus(t)
@@ -237,9 +280,14 @@ func Test_Bus(test *testing.T) {
 			is.True(len(drained(is, guarded)) == 0) // panicking filter drops the event
 		})
 	})
+}
 
-	test.Run("replay", func(t *testing.T) {
-		t.Run("subscribing after history picks it up", func(t *testing.T) {
+func testBusReplay(t *testing.T) {
+	t.Helper()
+	step(t, "replay", func(t *testing.T) {
+		t.Helper()
+		step(t, "subscribing after history picks it up", func(t *testing.T) {
+			t.Helper()
 			is := is.New(t)
 
 			b := newBus(t, popcorn.WithReplayBuffer(8))
@@ -254,7 +302,8 @@ func Test_Bus(test *testing.T) {
 			is.True(len(drained(is, late)) == 2) // the replay buffer must be seeded
 		})
 
-		t.Run("replay honors filter and backlog", func(t *testing.T) {
+		step(t, "replay honors filter and backlog", func(t *testing.T) {
+			t.Helper()
 			is := is.New(t)
 
 			b := newBus(t, popcorn.WithReplayBuffer(8))
@@ -276,7 +325,8 @@ func Test_Bus(test *testing.T) {
 			is.Equal(got[1].Payload, tick{N: 4})
 		})
 
-		t.Run("history thinner than backlog replays in full", func(t *testing.T) {
+		step(t, "history thinner than backlog replays in full", func(t *testing.T) {
+			t.Helper()
 			is := is.New(t)
 
 			// history of 2, subscription ring of 8: the seam must replay at
@@ -292,7 +342,8 @@ func Test_Bus(test *testing.T) {
 			is.True(len(drained(is, late)) == 2) // exactly the whole thin history
 		})
 
-		t.Run("no gap, no duplicate at the seam", func(t *testing.T) {
+		step(t, "no gap, no duplicate at the seam", func(t *testing.T) {
+			t.Helper()
 			is := is.New(t)
 
 			b := newBus(t, popcorn.WithReplayBuffer(8))
@@ -337,21 +388,25 @@ func Test_Bus(test *testing.T) {
 
 			uniq := map[int]int{}
 			for _, e := range seen {
-				n := e.Payload.(tick).N
-				uniq[n]++
-				is.True(uniq[n] == 1) // no duplicate delivery (seam)
+				tk, ok := e.Payload.(tick)
+				is.True(ok) // every seen event must carry a tick payload
+				uniq[tk.N]++
+				is.True(uniq[tk.N] == 1) // no duplicate delivery (seam)
 			}
 
 			got := make([]int, 0, len(seen))
 			for _, e := range seen {
-				got = append(got, e.Payload.(tick).N)
+				tk, ok := e.Payload.(tick)
+				is.True(ok)
+				got = append(got, tk.N)
 			}
 			for i, n := range got {
 				is.Equal(n, i+1) // order must be preserved across the seam
 			}
 		})
 
-		t.Run("replay off by default", func(t *testing.T) {
+		step(t, "rendezvous subscriber is not seeded", func(t *testing.T) {
+			t.Helper()
 			is := is.New(t)
 
 			b := newBus(t)
@@ -361,12 +416,17 @@ func Test_Bus(test *testing.T) {
 			late, err := b.Subscribe("late")
 			is.NoErr(err)
 
-			is.True(len(drained(is, late)) == 0) // without history, past events are not replayed
+			is.True(len(drained(is, late)) == 0) // a rendezvous subscription is never seeded
 		})
 	})
+}
 
-	test.Run("deliver", func(t *testing.T) {
-		t.Run("Send never stalls on a dead subscriber", func(t *testing.T) {
+func testBusMisc(t *testing.T) {
+	t.Helper()
+	step(t, "deliver", func(t *testing.T) {
+		t.Helper()
+		step(t, "Send never stalls on a dead subscriber", func(t *testing.T) {
+			t.Helper()
 			is := is.New(t)
 
 			b := newBus(t)
@@ -374,12 +434,13 @@ func Test_Bus(test *testing.T) {
 			is.NoErr(err)
 
 			pub := b.Publisher("p")
-			for i := 0; i < 100; i++ { // Send must return without delivery having happened
+			for i := range 100 { // Send must return without delivery having happened
 				is.NoErr(pub.Send(context.Background(), popcorn.NewEvent(tick{N: i})))
 			}
 		})
 
-		t.Run("canceled context surfaces as error", func(t *testing.T) {
+		step(t, "canceled context surfaces as error", func(t *testing.T) {
+			t.Helper()
 			is := is.New(t)
 
 			b := newBus(t)
@@ -390,9 +451,49 @@ func Test_Bus(test *testing.T) {
 
 			is.True(pub.Send(ctx, popcorn.NewEvent(tick{})) != nil) // a canceled ctx must not be swallowed
 		})
+
+		step(t, "unsubscribe and resubscribe during a filter must not panic", func(t *testing.T) {
+			t.Helper()
+			is := is.New(t)
+
+			b := newBus(t)
+			entered := make(chan struct{}, 1)
+			release := make(chan struct{})
+			_, err := b.Subscribe("racy",
+				popcorn.WithBacklog(4),
+				popcorn.WithFilter(func(popcorn.Event) bool {
+					select {
+					case entered <- struct{}{}:
+					default:
+					}
+					<-release
+					return true
+				}))
+			is.NoErr(err)
+
+			pub := b.Publisher("p")
+			sendErr := make(chan error, 1)
+			go func() { sendErr <- pub.Send(context.Background(), popcorn.NewEvent(tick{N: 1})) }()
+			<-entered
+
+			// Tear the filtered subscription down and replace it with the same id
+			// while Send is parked inside the filter.
+			b.Unsubscribe("racy")
+			_, err = b.Subscribe("racy", popcorn.WithBacklog(4))
+			is.NoErr(err)
+			close(release)
+
+			select {
+			case err := <-sendErr:
+				is.NoErr(err) // Send must survive the id being recycled
+			case <-time.After(never):
+				is.Fail() // Send never completed
+			}
+		})
 	})
 
-	test.Run("nil bus safety", func(t *testing.T) {
+	step(t, "nil bus safety", func(t *testing.T) {
+		t.Helper()
 		// B10: zero-value safety — every bus method on a nil target must be safe.
 		defer func() {
 			if r := recover(); r != nil {
@@ -406,7 +507,7 @@ func Test_Bus(test *testing.T) {
 		ch, err := b.Subscribe("x")
 		is.True(err != nil) // nil bus must surface an error
 		is.True(ch == nil)  // and never hand out a channel
-		
+
 		pu := b.Publisher("p")
 		if pu != nil {
 			_ = pu.Send(context.Background(), popcorn.NewEvent(tick{}))

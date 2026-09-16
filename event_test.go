@@ -14,8 +14,13 @@ import (
 type named struct{}
 
 func Test_Event(test *testing.T) {
+	test.Parallel()
 	test.Run("kind", func(t *testing.T) {
+		t.Parallel()
+		t.Helper()
 		t.Run("named payload derives the type name", func(t *testing.T) {
+			t.Parallel()
+			t.Helper()
 			is := is.New(t)
 
 			e := popcorn.NewEvent(named{})
@@ -23,19 +28,23 @@ func Test_Event(test *testing.T) {
 		})
 
 		t.Run("opaque payloads get a safe kind", func(t *testing.T) {
+			t.Parallel()
+			t.Helper()
 			is := is.New(t)
 
 			// B14: deriving must not panic for any, pointers and unnamed types.
-			probe := func(name string, e popcorn.Event) {
-				is.True(e.Kind != "") // kind must not collapse to empty for "+name"
+			probe := func(e popcorn.Event) {
+				is.True(e.Kind != "") // kind must not collapse to empty
 			}
 
-			probe("any", popcorn.NewEvent[any]("x"))
-			probe("map", popcorn.NewEvent(map[string]int{}))
-			probe("pointer", popcorn.NewEvent(&named{}))
+			probe(popcorn.NewEvent[any]("x"))
+			probe(popcorn.NewEvent(map[string]int{}))
+			probe(popcorn.NewEvent(&named{}))
 		})
 
 		t.Run("explicit kind via NewEventOf", func(t *testing.T) {
+			t.Parallel()
+			t.Helper()
 			is := is.New(t)
 
 			e := popcorn.NewEventOf("custom.kind", named{})
@@ -44,6 +53,8 @@ func Test_Event(test *testing.T) {
 		})
 
 		t.Run("kinds are distinct per payload type and stable", func(t *testing.T) {
+			t.Parallel()
+			t.Helper()
 			is := is.New(t)
 
 			first := popcorn.NewEvent(named{})
@@ -59,7 +70,11 @@ func Test_Event(test *testing.T) {
 	})
 
 	test.Run("timestamp", func(t *testing.T) {
+		t.Parallel()
+		t.Helper()
 		t.Run("NewEvent stamps At", func(t *testing.T) {
+			t.Parallel()
+			t.Helper()
 			is := is.New(t)
 
 			before := time.Now()
@@ -68,6 +83,8 @@ func Test_Event(test *testing.T) {
 		})
 
 		t.Run("NewEventOf stamps At", func(t *testing.T) {
+			t.Parallel()
+			t.Helper()
 			is := is.New(t)
 
 			before := time.Now()
@@ -77,15 +94,19 @@ func Test_Event(test *testing.T) {
 	})
 
 	test.Run("source is not caller owned", func(t *testing.T) {
+		t.Parallel()
+		t.Helper()
 		is := is.New(t)
 
 		// B19: the caller can never set the source field; it stays empty until
 		// a bound Publisher sets it in Send. No constructor accepts a source.
 		e := popcorn.NewEvent(named{})
-		is.Equal(e.Source(), "") //source must be empty before any Send
+		is.Equal(e.Source(), "") // source must be empty before any Send
 	})
 
 	test.Run("module state rendering", func(t *testing.T) {
+		t.Parallel()
+		t.Helper()
 		is := is.New(t)
 
 		states := []popcorn.ModuleState{
@@ -109,6 +130,8 @@ func Test_Event(test *testing.T) {
 	})
 
 	test.Run("kernel state rendering", func(t *testing.T) {
+		t.Parallel()
+		t.Helper()
 		is := is.New(t)
 
 		states := []popcorn.KernelState{
@@ -128,9 +151,11 @@ func Test_Event(test *testing.T) {
 	})
 
 	test.Run("unhealthy error shape", func(t *testing.T) {
+		t.Parallel()
+		t.Helper()
 		is := is.New(t)
 
-		cause := errors.New("boom")
+		cause := errBoom
 		err := popcorn.KernelUnhealthyError{ModuleID: "a", Cause: cause}
 
 		is.True(err.Error() != "")

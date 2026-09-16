@@ -3,7 +3,9 @@ package popcorn_test
 import (
 	"context"
 	"errors"
+	"fmt"
 	"testing"
+	"testing/synctest"
 	"time"
 
 	"github.com/matryer/is"
@@ -12,8 +14,20 @@ import (
 
 // The hermetic end-to-end contracts: whole-system behavior inside one
 // process - no network, no example code.
-func Test_E2E(test *testing.T) {
-	test.Run("ping story", func(t *testing.T) {
+func Test_E2E(t *testing.T) {
+	t.Parallel()
+	synctest.Test(t, testE2E)
+}
+
+func testE2E(test *testing.T) {
+	testPingStory(test)
+	testFailurePath(test)
+}
+
+func testPingStory(t *testing.T) {
+	t.Helper()
+	step(t, "ping story", func(t *testing.T) {
+		t.Helper()
 		is := is.New(t)
 
 		b := newBus(t, popcorn.WithReplayBuffer(8))
@@ -25,13 +39,13 @@ func Test_E2E(test *testing.T) {
 		// producer: sends `rounds` pings, then signals done.
 		producerStart := func(ctx context.Context) (popcorn.StopFunc, error) {
 			pub := b.Publisher("producer")
-			for i := 0; i < rounds; i++ {
+			for i := range rounds {
 				if err := pub.Send(ctx, popcorn.NewEvent(tick{N: i})); err != nil {
-					return nil, err
+					return nil, fmt.Errorf("producer send: %w", err)
 				}
 			}
 			close(producerDone)
-			return nil, nil
+			return noStop, nil
 		}
 
 		// collector: subscribes into the bus itself, acknowledges health,
@@ -39,15 +53,21 @@ func Test_E2E(test *testing.T) {
 		received := make(chan []int, 1)
 
 		collectorStart := func(ctx context.Context) (popcorn.StopFunc, error) {
-			ch, err := b.Subscribe("collector", popcorn.WithBacklog(rounds))
+			ch, err := b.Subscribe("collector",
+				popcorn.WithBacklog(rounds),
+				popcorn.WithFilter(func(e popcorn.Event) bool {
+					_, ok := e.Payload.(tick)
+					return ok
+				}))
 			if err != nil {
-				return nil, err
+				return nil, fmt.Errorf("collector subscribe: %w", err)
 			}
 
 			pub := b.Publisher("collector")
 			if err := pub.Send(ctx, popcorn.NewEvent(
-				popcorn.ModuleStateChanged{To: popcorn.ModuleStateOK})); err != nil {
-				return nil, err
+				popcorn.ModuleStateChanged{To: popcorn.ModuleStateOK},
+			)); err != nil {
+				return nil, fmt.Errorf("collector health: %w", err)
 			}
 
 			go func() {
@@ -99,17 +119,23 @@ func Test_E2E(test *testing.T) {
 			is.Fail() // collector never received a full round
 		}
 	})
+}
 
-	test.Run("failure path", func(t *testing.T) {
+func testFailurePath(t *testing.T) {
+	t.Helper()
+	step(t, "failure path", func(t *testing.T) {
+		t.Helper()
+
 		is := is.New(t)
 
 		b := newBus(t, popcorn.WithReplayBuffer(8))
 		stops := make(chan string, 8)
 
 		failing, err := popcorn.NewModule(popcorn.ModRecipe{
-			ID:    "failing",
-			Start: healthStart("failing", b, popcorn.ModuleStateNOK, errors.New("connection refused")),
-			Done:  closeOnStart(),
+			ID: "failing",
+			Start: func(context.Context) (popcorn.StopFunc, error) {
+				return stopped(stops, "failing"), nil
+			},
 		})
 		is.NoErr(err)
 
@@ -133,9 +159,19 @@ func Test_E2E(test *testing.T) {
 		ctx, cancel := within()
 		defer cancel()
 
-		err = k.Start(ctx)
+		// Let the whole fleet come up and only then report the failure, so the
+		// NOK genuinely tests shutdown rather than start cancellation.
+		done := make(chan error, 1)
+		go func() { done <- k.Start(ctx) }()
+		waitRunning(is, b)
+
+		is.NoErr(b.Publisher("failing").Send(ctx, popcorn.NewEvent(popcorn.ModuleStateChanged{
+			To:    popcorn.ModuleStateNOK,
+			Cause: errConnectionRefused,
+		})))
+
 		var unhealthy popcorn.KernelUnhealthyError
-		is.True(errors.As(err, &unhealthy))
+		is.True(errors.As(<-done, &unhealthy))
 		is.Equal(unhealthy.ModuleID, "failing")
 
 		select {

@@ -24,12 +24,6 @@ tasks:
     cmds:
       - go test -count 1 -race -coverpkg=./... ./...
 
-  run:
-    desc: "Run the example application"
-    deps: [setup]
-    cmds:
-      - go run ./examples
-
   test:reports:
     desc: "Print total code coverage"
     preconditions:

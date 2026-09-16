@@ -41,6 +41,13 @@ func Test_Event(t *testing.T) {
 		is.Equal(e.Payload, named{})
 	})
 
+	t.Run("nil payload derives the nil kind", func(t *testing.T) {
+		t.Parallel()
+		is := is.New(t)
+
+		is.Equal(popcorn.NewEvent[any](nil).Kind, "nil") // a nil payload must not panic kind derivation
+	})
+
 	t.Run("kinds are distinct per payload type and stable", func(t *testing.T) {
 		t.Parallel()
 		is := is.New(t)
@@ -97,6 +104,8 @@ func Test_Event(t *testing.T) {
 		is.Equal(popcorn.ModuleStateOK.IsHealthy(), true)       // only OK is healthy
 		is.Equal(popcorn.ModuleStateTempNOK.IsHealthy(), false) // temporary failure is not healthy
 		is.Equal(popcorn.ModuleStateNOK.IsHealthy(), false)     // failure is not healthy
+
+		is.Equal(popcorn.ModuleState(99).String(), "module-state(99)") // an out-of-range state must render its numeric value
 	})
 
 	t.Run("kernel state rendering", func(t *testing.T) {
@@ -108,6 +117,8 @@ func Test_Event(t *testing.T) {
 		is.Equal(popcorn.KernelStateRunning.String(), "running")
 		is.Equal(popcorn.KernelStateStopping.String(), "stopping")
 		is.Equal(popcorn.KernelStateStopped.String(), "stopped")
+
+		is.Equal(popcorn.KernelState(99).String(), "kernel-state(99)") // an out-of-range state must render its numeric value
 	})
 
 	t.Run("unhealthy error shape", func(t *testing.T) {
@@ -118,5 +129,15 @@ func Test_Event(t *testing.T) {
 
 		is.Equal(err.Error(), `module "a" unhealthy: boom`)
 		is.True(errors.Is(err, errBoom)) // Unwrap must expose the cause
+	})
+
+	t.Run("unhealthy error without a cause", func(t *testing.T) {
+		t.Parallel()
+		is := is.New(t)
+
+		err := popcorn.KernelUnhealthyError{ModuleID: "a", Cause: nil}
+
+		is.Equal(err.Error(), `module "a" unhealthy`) // a missing cause must not render a trailing separator
+		is.True(err.Unwrap() == nil)
 	})
 }

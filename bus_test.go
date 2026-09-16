@@ -5,6 +5,7 @@ import (
 	"errors"
 	"testing"
 	"testing/synctest"
+	"time"
 
 	"github.com/matryer/is"
 	"github.com/paluszkiewiczB/popcorn"
@@ -50,6 +51,15 @@ func TestBusOptions(t *testing.T) {
 		b := newBus(t)
 		_, err := b.Subscribe("")
 		is.True(err != nil) // Subscribe must reject an empty id
+	})
+
+	t.Run("nil bus logger falls back to discard", func(t *testing.T) {
+		t.Parallel()
+		is := is.New(t)
+
+		b, err := popcorn.NewBus(popcorn.WithBusLogger(nil))
+		is.NoErr(err) // a nil logger must be replaced by a discarding one
+		b.Close()
 	})
 
 	t.Run("duplicate id rejected", func(t *testing.T) {
@@ -563,5 +573,49 @@ func TestBusMisc(t *testing.T) {
 			_ = pu.Send(context.Background(), popcorn.NewEvent(tick{}))
 		}
 		b.Unsubscribe("x")
+		b.Close() // nil bus Close must be safe too
+
+		var p *popcorn.Publisher
+		err = p.Send(context.Background(), popcorn.NewEvent(tick{}))
+		is.True(err != nil) // a nil publisher must surface an error, not panic
+	})
+}
+
+func TestBusRendezvousShedding(t *testing.T) {
+	t.Parallel()
+	t.Run("a shedding rendezvous subscription resumes", func(t *testing.T) {
+		t.Parallel()
+		synctest.Test(t, func(t *testing.T) {
+			is := is.New(t)
+
+			b := newBus(t)
+			ch, err := b.Subscribe("rendezvous") // unbuffered: cap-0 rendezvous delivery
+			is.NoErr(err)
+
+			pub := b.Publisher("p")
+
+			// Three unread sends: one lands in the hand-off, the next overflows
+			// into the inbox, and the third aborts the in-flight delivery and
+			// puts the subscription into shedding mode.
+			for i := range 3 {
+				is.NoErr(pub.Send(context.Background(), popcorn.NewEvent(tick{N: i})))
+			}
+			synctest.Wait() // the delivery goroutine has settled into shedding
+
+			// A reader catches up; the next send must break shedding and be
+			// delivered instead of dropped.
+			got := make(chan popcorn.Event, 1)
+			go func() { got <- <-ch }()
+			synctest.Wait() // the reader is now durably parked on the channel
+
+			is.NoErr(pub.Send(context.Background(), popcorn.NewEvent(tick{N: 99})))
+
+			select {
+			case e := <-got:
+				is.Equal(e.Payload, tick{N: 99}) // shedding must end once the reader keeps up
+			case <-time.After(never):
+				is.Fail() // the rendezvous subscription never resumed
+			}
+		})
 	})
 }

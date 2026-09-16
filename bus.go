@@ -45,6 +45,13 @@ func NewBus(opts ...BusOption) (*Bus, error) {
 			return nil, err
 		}
 	}
+	return newBus(cfg), nil
+}
+
+// newBus builds a Bus from an already-resolved config. Unlike NewBus it cannot
+// fail, so callers that assemble the config directly (the Kernel's own bus) need
+// no error path.
+func newBus(cfg busConfig) *Bus {
 	if cfg.log == nil {
 		cfg.log = discardLogger()
 	}
@@ -55,7 +62,7 @@ func NewBus(opts ...BusOption) (*Bus, error) {
 	if cfg.replayBuffer > 0 {
 		b.history = make([]Event, cfg.replayBuffer)
 	}
-	return b, nil
+	return b
 }
 
 // Subscribe registers a subscription under id and returns its receive-only
@@ -223,10 +230,6 @@ func (s *subscription) offerBuffered(e Event) {
 // event aborts the hand-off and sheds until a reader catches up.
 func (s *subscription) offerRendezvous(e Event) {
 	s.mu.Lock()
-	if s.closed {
-		s.mu.Unlock()
-		return
-	}
 	if len(s.inbox) == 0 && s.waiting && !s.handoffClaimed {
 		// The delivery goroutine is idle: hand over synchronously. The claim flag
 		// keeps a second send from racing the receiver's reset.
@@ -247,12 +250,9 @@ func (s *subscription) offerRendezvous(e Event) {
 	s.mu.Unlock()
 }
 
+// abortLocked is only ever reached under s.mu with a fresh abort channel: every
+// call replaces the one it closes, and teardown runs at most once.
 func (s *subscription) abortLocked() {
-	select {
-	case <-s.abort:
-		return
-	default:
-	}
 	close(s.abort)
 	s.abort = make(chan struct{})
 }
@@ -276,8 +276,6 @@ func (s *subscription) cap0Loop() {
 		case s.ch <- e:
 		case <-abort:
 			s.setShedding(true)
-		case <-s.done:
-			return
 		}
 	}
 }

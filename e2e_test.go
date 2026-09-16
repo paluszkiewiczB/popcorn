@@ -122,9 +122,9 @@ func TestE2EFailurePath(t *testing.T) {
 		stops := make(chan string, 8)
 
 		failing, err := popcorn.NewModule(popcorn.ModRecipe{
-			ID: "failing",
+			ID: failingID,
 			Start: func(context.Context) (popcorn.StopFunc, error) {
-				return stopped(stops, "failing"), nil
+				return stopped(stops, failingID), nil
 			},
 		})
 		is.NoErr(err)
@@ -134,7 +134,7 @@ func TestE2EFailurePath(t *testing.T) {
 		// they do not abandon it.
 		healthy, err := popcorn.NewModule(popcorn.ModRecipe{
 			ID:           "healthy",
-			Dependencies: []string{"failing"},
+			Dependencies: []string{failingID},
 			Start: func(context.Context) (popcorn.StopFunc, error) {
 				return stopped(stops, "healthy"), nil
 			},
@@ -155,14 +155,14 @@ func TestE2EFailurePath(t *testing.T) {
 		go func() { done <- k.Start(ctx) }()
 		waitRunning(is, b)
 
-		is.NoErr(b.Publisher("failing").Send(ctx, popcorn.NewEvent(popcorn.ModuleStateChanged{
+		is.NoErr(b.Publisher(failingID).Send(ctx, popcorn.NewEvent(popcorn.ModuleStateChanged{
 			To:    popcorn.ModuleStateNOK,
 			Cause: errConnectionRefused,
 		})))
 
 		unhealthy, ok := errors.AsType[popcorn.KernelUnhealthyError](<-done)
 		is.True(ok)
-		is.Equal(unhealthy.ModuleID, "failing")
+		is.Equal(unhealthy.ModuleID, failingID)
 
 		select {
 		case id := <-stops:

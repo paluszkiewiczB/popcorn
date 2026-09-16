@@ -4,6 +4,7 @@ import (
 	"context"
 	"errors"
 	"fmt"
+	"log/slog"
 	"strings"
 	"sync"
 	"sync/atomic"
@@ -216,6 +217,27 @@ func TestKernelValidation(t *testing.T) {
 		is.True(err != nil) // parallelism must not be negative
 	})
 
+	t.Run("negative health tick rejected", func(t *testing.T) {
+		t.Parallel()
+		is := is.New(t)
+		_, err := popcorn.NewKernel(popcorn.WithHealthTick(-1))
+		is.True(err != nil) // a negative tick must be rejected
+	})
+
+	t.Run("negative stop timeout rejected", func(t *testing.T) {
+		t.Parallel()
+		is := is.New(t)
+		_, err := popcorn.NewKernel(popcorn.WithStopTimeout(-1))
+		is.True(err != nil) // a negative stop budget must be rejected
+	})
+
+	t.Run("logger option accepted", func(t *testing.T) {
+		t.Parallel()
+		is := is.New(t)
+		_, err := popcorn.NewKernel(popcorn.WithLogger(slog.New(slog.DiscardHandler)))
+		is.NoErr(err) // a logger must be settable on the kernel
+	})
+
 	t.Run("tiny health tick accepted", func(t *testing.T) {
 		t.Parallel()
 		is := is.New(t)
@@ -321,6 +343,35 @@ func TestKernelLifecycle(t *testing.T) {
 			defer cancel()
 
 			is.True(errors.Is(k.Start(ctx), popcorn.ErrKernelStopped)) // default bus must work end to end
+		})
+	})
+
+	t.Run("health tick drives a long-running loop", func(t *testing.T) {
+		t.Parallel()
+		synctest.Test(t, func(t *testing.T) {
+			is := is.New(t)
+
+			b := newBus(t, popcorn.WithReplayBuffer(8))
+			m, err := popcorn.NewModule(popcorn.ModRecipe{ID: "m", Start: noopStart})
+			is.NoErr(err)
+
+			// A non-task module keeps the kernel up until canceled, so the health
+			// ticker is the only thing waking the loop.
+			k, err := popcorn.NewKernel(popcorn.WithBus(b),
+				popcorn.WithHealthTick(time.Millisecond),
+				popcorn.WithModules(m))
+			is.NoErr(err)
+
+			ctx, cancel := context.WithCancel(context.Background())
+			defer cancel()
+			done := make(chan error, 1)
+			go func() { done <- k.Start(ctx) }()
+			waitRunning(is, b)
+
+			time.Sleep(5 * time.Millisecond) // let several health ticks fire
+			cancel()
+
+			is.True(errors.Is(<-done, context.Canceled)) // a canceled run returns the context error
 		})
 	})
 }
@@ -1342,6 +1393,129 @@ func TestKernelLateFinish(t *testing.T) {
 					is.True(ev != "state:running") // stopping must never regress to running
 				}
 			}
+		})
+	})
+}
+
+func TestKernelCoordination(t *testing.T) {
+	t.Parallel()
+
+	t.Run("a bus that already owns the kernel subscription is rejected", func(t *testing.T) {
+		t.Parallel()
+		synctest.Test(t, func(t *testing.T) {
+			is := is.New(t)
+
+			b := newBus(t, popcorn.WithReplayBuffer(8))
+			_, err := b.Subscribe("kernel", popcorn.WithBacklog(1))
+			is.NoErr(err) // the reserved id is ours for this test
+
+			m, err := popcorn.NewModule(popcorn.ModRecipe{ID: "m", Start: noopStart})
+			is.NoErr(err)
+			k, err := popcorn.NewKernel(popcorn.WithBus(b), popcorn.WithModules(m))
+			is.NoErr(err)
+
+			is.True(k.Start(context.Background()) != nil) // a taken health stream must fail the start
+		})
+	})
+
+	t.Run("replayed health is discarded at bootstrap", func(t *testing.T) {
+		t.Parallel()
+		synctest.Test(t, func(t *testing.T) {
+			is := is.New(t)
+
+			b := newBus(t, popcorn.WithReplayBuffer(8))
+			// A NOK from before the kernel exists is replayed into the health
+			// stream and must be dropped, not treated as a live failure.
+			is.NoErr(b.Publisher("ghost").Send(context.Background(),
+				popcorn.NewEvent(popcorn.ModuleStateChanged{To: popcorn.ModuleStateNOK, Cause: errBoom})))
+
+			task, err := popcorn.NewModule(popcorn.ModRecipe{
+				ID: taskID, Done: closeOnStart(), Start: noopStart,
+			})
+			is.NoErr(err)
+			k, err := popcorn.NewKernel(popcorn.WithBus(b), popcorn.WithModules(task))
+			is.NoErr(err)
+
+			ctx, cancel := within()
+			defer cancel()
+
+			is.True(errors.Is(k.Start(ctx), popcorn.ErrKernelStopped)) // a stale NOK must not fail the run
+		})
+	})
+
+	t.Run("a halted dependency wait aborts", func(t *testing.T) {
+		t.Parallel()
+		synctest.Test(t, func(t *testing.T) {
+			is := is.New(t)
+
+			b := newBus(t, popcorn.WithReplayBuffer(8))
+			block := make(chan struct{})
+			defer close(block)
+
+			stuck, err := popcorn.NewModule(popcorn.ModRecipe{
+				ID: "stuck",
+				Start: func(context.Context) (popcorn.StopFunc, error) {
+					<-block // never returns, so its dependent is never released
+					return noStop, nil
+				},
+			})
+			is.NoErr(err)
+			waiter, err := popcorn.NewModule(popcorn.ModRecipe{
+				ID: "waiter", Dependencies: []string{"stuck"}, Start: noopStart,
+			})
+			is.NoErr(err)
+			failing, err := popcorn.NewModule(popcorn.ModRecipe{
+				ID: failingID, Start: healthStart(failingID, b, popcorn.ModuleStateNOK, errBoom),
+			})
+			is.NoErr(err)
+
+			k, err := popcorn.NewKernel(popcorn.WithBus(b), popcorn.WithModules(stuck, waiter, failing))
+			is.NoErr(err)
+
+			ctx, cancel := within()
+			defer cancel()
+
+			is.True(!errors.Is(k.Start(ctx), popcorn.ErrKernelStopped)) // the NOK must fail the run
+		})
+	})
+
+	t.Run("a canceled run releases slot waiters", func(t *testing.T) {
+		t.Parallel()
+		synctest.Test(t, func(t *testing.T) {
+			is := is.New(t)
+
+			b := newBus(t, popcorn.WithReplayBuffer(8))
+			block := make(chan struct{})
+			defer close(block)
+
+			// With a single start slot, one module holds it and blocks while the
+			// other parks waiting for it; canceling the run must release the
+			// waiter through the halt signal rather than by freeing the slot.
+			mk := func(id string) popcorn.Module {
+				m, err := popcorn.NewModule(popcorn.ModRecipe{
+					ID: id,
+					Start: func(context.Context) (popcorn.StopFunc, error) {
+						<-block // ignores cancellation, holds the only slot
+						return noStop, nil
+					},
+				})
+				is.NoErr(err)
+				return m
+			}
+
+			k, err := popcorn.NewKernel(popcorn.WithBus(b),
+				popcorn.WithParallelism(1),
+				popcorn.WithModules(mk("a"), mk("b")))
+			is.NoErr(err)
+
+			ctx, cancel := context.WithCancel(context.Background())
+			defer cancel()
+			done := make(chan error, 1)
+			go func() { done <- k.Start(ctx) }()
+			synctest.Wait() // one module holds the slot, the other is parked on it
+			cancel()
+
+			is.True(errors.Is(<-done, context.Canceled)) // a canceled run returns the context error
 		})
 	})
 }

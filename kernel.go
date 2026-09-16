@@ -145,11 +145,8 @@ func newKernelRun(ctx context.Context, cfg kernelConfig) (*kernelRun, error) {
 	b := cfg.bus
 	ownsBus := b == nil
 	if ownsBus {
-		nb, err := NewBus(WithBusLogger(cfg.log))
-		if err != nil {
-			return nil, err
-		}
-		b = nb
+		// The kernel's own bus takes no options, so its construction cannot fail.
+		b = newBus(busConfig{log: cfg.log, replayBuffer: defaultHistoryCap})
 	}
 	run := &kernelRun{
 		cfg:     cfg,
@@ -173,9 +170,9 @@ func newKernelRun(ctx context.Context, cfg kernelConfig) (*kernelRun, error) {
 			return ok && msc.To == ModuleStateNOK
 		}))
 	if err != nil {
-		if ownsBus {
-			b.Close()
-		}
+		// Only a caller-supplied bus can fail here (a duplicate "kernel"
+		// subscription); a freshly built one is empty, so there is nothing to
+		// close and the caller owns teardown of the bus it supplied.
 		run.transition(ctx, KernelStateStopped, err)
 		return nil, err
 	}
@@ -189,16 +186,13 @@ func newKernelRun(ctx context.Context, cfg kernelConfig) (*kernelRun, error) {
 	return run, nil
 }
 
+// drainHealth discards anything the subscribe-time replay seeded: no module has
+// started yet, so every queued health event is either stale history or
+// out-of-band. Draining by buffered length keeps the read path branch-free; a
+// torn-down stream would report zero length and end the drain.
 func (run *kernelRun) drainHealth() {
-	for {
-		select {
-		case _, ok := <-run.health:
-			if !ok {
-				return
-			}
-		default:
-			return
-		}
+	for len(run.health) > 0 {
+		<-run.health
 	}
 }
 
@@ -289,7 +283,7 @@ func (run *kernelRun) startModules(ctx context.Context) {
 }
 
 func (run *kernelRun) startModule(ctx context.Context, r *moduleRun) {
-	if !run.waitDependencies(ctx, r) || !run.acquireSlot(ctx) {
+	if !run.waitDependencies(r) || !run.acquireSlot() {
 		return
 	}
 	defer run.releaseSlot()
@@ -303,26 +297,25 @@ func (run *kernelRun) startModule(ctx context.Context, r *moduleRun) {
 	run.recordStarted(ctx, r, stop, time.Since(start))
 }
 
-func (run *kernelRun) waitDependencies(ctx context.Context, r *moduleRun) bool {
+// waitDependencies parks until every dependency's Start has returned. A halt is
+// the kernel's single shutdown signal and is always closed before Start returns,
+// so cancellation reaches waiting modules through it.
+func (run *kernelRun) waitDependencies(r *moduleRun) bool {
 	for _, dep := range r.deps {
 		select {
 		case <-run.rts[dep].ready:
 		case <-run.halt:
-			return false
-		case <-ctx.Done():
 			return false
 		}
 	}
 	return true
 }
 
-func (run *kernelRun) acquireSlot(ctx context.Context) bool {
+func (run *kernelRun) acquireSlot() bool {
 	select {
 	case run.slots <- struct{}{}:
 		return true
 	case <-run.halt:
-		return false
-	case <-ctx.Done():
 		return false
 	}
 }
@@ -348,18 +341,18 @@ func (run *kernelRun) failure() error {
 // starting during shutdown is stopped right away instead.
 func (run *kernelRun) recordStarted(ctx context.Context, r *moduleRun, stop StopFunc, took time.Duration) {
 	doneAlready := run.markStarted(r, stop)
-	allStarted := run.allStarted()
+	// r.order is unique per start, so exactly one module lands on the last
+	// position; only that one may publish Running. Deriving "last" from the
+	// order avoids the race where two finishing starts both observe allStarted.
+	last := r.order == len(run.runs)-1
 
-	if !run.publishStart(ctx, r, took) {
+	if !run.publishStart(ctx, r, took, last) {
 		_ = run.stopModule(ctx, r, time.Now().Add(run.cfg.stopTimeout))
 		close(r.ready)
 		return
 	}
 	close(r.ready)
 
-	if allStarted {
-		run.transition(ctx, KernelStateRunning, nil)
-	}
 	if r.task != nil && !doneAlready {
 		go run.watchTask(r)
 	}
@@ -380,12 +373,6 @@ func (run *kernelRun) markStarted(r *moduleRun, stop StopFunc) bool {
 		run.doneTasks++
 	}
 	return doneAlready
-}
-
-func (run *kernelRun) allStarted() bool {
-	run.kmu.Lock()
-	defer run.kmu.Unlock()
-	return run.startedCount == len(run.runs)
 }
 
 func isClosed(ch <-chan struct{}) bool {
@@ -446,10 +433,10 @@ func (run *kernelRun) wait(ctx context.Context) (loopEvent, Event, error) {
 			return eventFailed, Event{}, err
 		}
 		return eventIdle, Event{}, nil
-	case e, ok := <-run.health:
-		if !ok {
-			return eventFailed, Event{}, errHealthGone
-		}
+	case e := <-run.health:
+		// checkHealth at the top of the loop is the single place that detects a
+		// closed stream: a closed channel yields a zero Event that handleHealth
+		// ignores, and the next iteration ends the run with errHealthGone.
 		return eventHealth, e, nil
 	case <-run.tick():
 		return eventTick, Event{}, nil
@@ -460,6 +447,12 @@ func (run *kernelRun) loop(ctx context.Context) error {
 	for {
 		if err := run.checkHealth(); err != nil {
 			return run.finish(ctx, err)
+		}
+		// Idleness is re-checked every iteration, after health, so a queued NOK
+		// can never be masked by an idle completion that won a select race.
+		if run.isIdle() {
+			return errors.Join(append(run.shutdown(ctx, nil),
+				fmt.Errorf("kernel finished its work: %w", ErrKernelStopped))...)
 		}
 		event, payload, err := run.wait(ctx)
 		keepGoing, herr := run.handleEvent(ctx, event, payload, err)
@@ -481,19 +474,8 @@ func (run *kernelRun) handleEvent(ctx context.Context, event loopEvent, payload 
 		if herr := run.handleHealth(payload); herr != nil {
 			return false, run.finish(ctx, herr)
 		}
-	case eventTick:
-		// health is re-checked at the top of the loop
-	case eventIdle:
-		// A NOK may be queued from before the idle wake but have lost the
-		// select to it (both cases were ready). Drain health once more so an
-		// idle completion can never mask a reported failure.
-		if herr := run.checkHealth(); herr != nil {
-			return false, run.finish(ctx, herr)
-		}
-		if run.isIdle() {
-			return false, errors.Join(append(run.shutdown(ctx, nil),
-				fmt.Errorf("kernel finished its work: %w", ErrKernelStopped))...)
-		}
+	case eventTick, eventIdle:
+		// Health and idleness are both re-checked at the top of the loop.
 	}
 	return true, nil
 }
@@ -528,40 +510,26 @@ func (run *kernelRun) checkHealth() error {
 }
 
 func (run *kernelRun) handleHealth(e Event) error {
-	msc, ok := e.Payload.(ModuleStateChanged)
-	if !ok {
-		return nil
-	}
+	// The health subscription filter admits only ModuleStateNOK payloads, so the
+	// type assertion is safe and no state re-check is needed here.
+	msc, _ := e.Payload.(ModuleStateChanged)
 	r, known := run.rts[e.Source()]
-	if !known || msc.To != ModuleStateNOK {
+	if !known {
 		return nil
 	}
 	return KernelUnhealthyError{ModuleID: r.id, Cause: msc.Cause}
 }
 
 // transition publishes KernelStateChanged atomically with the state change, so the
-// delivered event order always matches the lifecycle order.
+// delivered event order always matches the lifecycle order. Every caller issues
+// only a legal move: starting is published once at bootstrap, and shutdown is
+// the sole source of stopping/stopped, issued once from start to finish.
 func (run *kernelRun) transition(ctx context.Context, to KernelState, cause error) {
 	run.stateMu.Lock()
 	defer run.stateMu.Unlock()
-	if !canTransition(run.state, to) {
-		return
-	}
 	from := run.state
 	run.state = to
 	_ = run.pub.Send(context.WithoutCancel(ctx), NewEvent(KernelStateChanged{From: from, To: to, Cause: cause}))
-}
-
-// canTransition encodes the lifecycle order: once shutdown has begun the only
-// remaining move is to Stopped, so a late module can never revive the kernel.
-func canTransition(from, to KernelState) bool {
-	if from == to || from == KernelStateStopped {
-		return false
-	}
-	if from == KernelStateStopping {
-		return to == KernelStateStopped
-	}
-	return true
 }
 
 func (run *kernelRun) shutdown(ctx context.Context, cause error) []error {
@@ -639,16 +607,23 @@ func (run *kernelRun) stopModule(ctx context.Context, r *moduleRun, deadline tim
 	return err
 }
 
-// publishStart publishes ModuleStarted while holding stateMu, so it can never be
-// ordered after a Stopping/Stopped transition. It reports false when shutdown has
-// already begun.
-func (run *kernelRun) publishStart(ctx context.Context, r *moduleRun, took time.Duration) bool {
+// publishStart publishes ModuleStarted, and for the last module to start also
+// the Running transition, atomically under stateMu: a start can never be ordered
+// after a Stopping/Stopped transition. It reports false when shutdown has already
+// begun, so a late start cannot revive the kernel.
+func (run *kernelRun) publishStart(ctx context.Context, r *moduleRun, took time.Duration, last bool) bool {
 	run.stateMu.Lock()
 	defer run.stateMu.Unlock()
 	if run.state == KernelStateStopping || run.state == KernelStateStopped {
 		return false
 	}
 	_ = run.pub.Send(context.WithoutCancel(ctx), NewEvent(ModuleStarted{ID: r.id, Order: r.order, StartTook: took}))
+	if last {
+		from := run.state
+		run.state = KernelStateRunning
+		running := NewEvent(KernelStateChanged{From: from, To: KernelStateRunning, Cause: nil})
+		_ = run.pub.Send(context.WithoutCancel(ctx), running)
+	}
 	return true
 }
 

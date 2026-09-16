@@ -34,9 +34,10 @@ func noopStart(context.Context) (popcorn.StopFunc, error) { return noStop, nil }
 
 // Common module ids reused across lifecycle specs.
 const (
-	taskID = "task"
-	depID  = "dep"
-	fastID = "fast"
+	taskID    = "task"
+	depID     = "dep"
+	fastID    = "fast"
+	failingID = "failing"
 )
 
 // within returns a context that outlives the whole test run of one spec.

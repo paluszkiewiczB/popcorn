@@ -9,8 +9,6 @@ import (
 	"github.com/paluszkiewiczB/popcorn"
 )
 
-// honest is a module implementation bypassing recipes, for cases where the
-// contract under test is the kernel's handling of arbitrary Module values.
 type honest struct {
 	id   string
 	deps []string
@@ -28,7 +26,7 @@ func Test_Module(t *testing.T) {
 		is := is.New(t)
 
 		m, err := popcorn.NewModule(popcorn.ModRecipe{Start: noopStart})
-		is.True(errors.Is(err, popcorn.ErrModuleIDNotSet)) // NewModule must reject an empty id
+		is.True(errors.Is(err, popcorn.ErrModuleIDNotSet))
 		is.True(m == nil)
 	})
 
@@ -37,7 +35,7 @@ func Test_Module(t *testing.T) {
 		is := is.New(t)
 
 		m, err := popcorn.NewModule(*recipe("kernel", noopStart))
-		is.True(errors.Is(err, popcorn.ErrModuleIDReserved)) // "kernel" is reserved by the kernel
+		is.True(errors.Is(err, popcorn.ErrModuleIDReserved))
 		is.True(m == nil)
 	})
 
@@ -46,7 +44,7 @@ func Test_Module(t *testing.T) {
 		is := is.New(t)
 
 		m, err := popcorn.NewModule(popcorn.ModRecipe{ID: "a"})
-		is.True(errors.Is(err, popcorn.ErrModuleStartNotSet)) // a recipe without Start is rejected
+		is.True(errors.Is(err, popcorn.ErrModuleStartNotSet))
 		is.True(m == nil)
 	})
 
@@ -61,7 +59,7 @@ func Test_Module(t *testing.T) {
 		is.Equal(len(m.Dependencies()), 0)
 
 		tm, isTask := m.(popcorn.TaskModule)
-		is.Equal(isTask, true) // module with Done must satisfy TaskModule
+		is.Equal(isTask, true)
 		is.Equal(tm.Done(), (<-chan struct{})(done))
 	})
 
@@ -72,7 +70,7 @@ func Test_Module(t *testing.T) {
 		plain, err := popcorn.NewModule(*recipe("plain", noopStart))
 		is.NoErr(err)
 		_, isTask := plain.(popcorn.TaskModule)
-		is.Equal(isTask, false) // module without Done must not satisfy TaskModule
+		is.Equal(isTask, false)
 	})
 
 	t.Run("dependencies are copied defensively", func(t *testing.T) {
@@ -83,16 +81,16 @@ func Test_Module(t *testing.T) {
 		m, err := popcorn.NewModule(popcorn.ModRecipe{ID: "copy", Dependencies: deps, Start: noopStart})
 		is.NoErr(err)
 
-		deps[0] = "mutated" // mutating the caller's slice after NewModule
+		deps[0] = "mutated"
 
-		is.Equal(m.Dependencies(), []string{"a"}) // the module must keep a defensive copy
+		is.Equal(m.Dependencies(), []string{"a"})
 	})
 
 	t.Run("nil closer yields nil stop", func(t *testing.T) {
 		t.Parallel()
 		is := is.New(t)
 
-		is.True(popcorn.StopFuncFromCloser(nil) == nil) // nil io.Closer => nil StopFunc
+		is.True(popcorn.StopCloser(nil) == nil)
 	})
 
 	t.Run("closer adapts to stop", func(t *testing.T) {
@@ -100,10 +98,10 @@ func Test_Module(t *testing.T) {
 		is := is.New(t)
 
 		closed := false
-		sf := popcorn.StopFuncFromCloser(&closerSpy{onClose: func() { closed = true }})
+		sf := popcorn.StopCloser(&closerSpy{onClose: func() { closed = true }})
 		is.True(sf != nil)
 		is.NoErr(sf(context.Background()))
-		is.Equal(closed, true) // StopFunc must invoke Close
+		is.Equal(closed, true)
 	})
 }
 

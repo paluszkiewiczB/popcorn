@@ -52,12 +52,18 @@ not a refactor.
 
 ## Implementation notes
 
-- **Dependency order.** A module starts once every dependency's `Start` has returned.
-  Stop order is descending dependency depth: every dependent is stopped before
-  anything it depends on.
-- **Shutdown budget.** Each `StopFunc` receives a context carved out of the shared
-  budget and runs in its own goroutine, so one that ignores its context cannot hang
-  shutdown; it is abandoned at the deadline.
+- **Dependency order.** A module starts once every dependency has completed: a plain
+  `Module` when its `Start` returns, a `TaskModule` when its `Done` closes.
+- **Stop order.** Shutdown stops by descending dependency depth: every dependent is
+  stopped before anything it depends on. A completed `TaskModule` is the exception:
+  its `StopFunc` runs immediately on `Done`, before its dependents.
+- **Task completion.** A finished `TaskModule` has its `StopFunc` called immediately,
+  once; later shutdown calls are no-ops. The kernel exits on completion only when
+  every module is a `TaskModule`.
+- **Shutdown budget.** Each shutdown-wave `StopFunc` receives a context carved out of
+  the shared budget and runs in its own goroutine, so one that ignores its context
+  cannot hang shutdown; it is abandoned at the deadline. A `TaskModule` stopped on
+  completion gets a fresh budget.
 - **Lifecycle events under lock.** The kernel publishes `ModuleStarted` and
   `KernelStateChanged` while holding its state lock, so delivered order matches
   lifecycle order. Event filters must be pure and non-blocking: a filter that blocks
@@ -93,7 +99,7 @@ not a refactor.
   in structs.
 - `ctx` is always the first parameter.
 - Use `chan struct{}` for pure signaling. The Bus uses bounded channels (buffer
-  size = backlog, 0 by default); do not "simplify" them away.
+  size = backlog, a minimum of one by default); Send must never block on a reader.
 - Use `sync.Mutex` for shared state, channels for coordination and ownership
   transfer.
 - `wg.Add(n)` (or `wg.Go`) before launching goroutines.
@@ -104,15 +110,17 @@ not a refactor.
 
 - Table-driven tests with `map[string]struct{}`.
 - Tests alongside code (`kernel.go` → `kernel_test.go`).
-- Run `task test`; run `task test:race` for the race detector (requires cgo).
+- Run `task ci` before proposing a change; it enforces 100% statement coverage.
+  Run `task test:race` for the race detector (requires cgo).
 - Use `testing/synctest` for time-dependent tests; avoid `time.Sleep`.
 - Use real transports and test doubles over mocks.
-- Aim for ≥80% coverage.
+- Coverage must not drop below `REQUIRED_CODE_COVERAGE` (100); add tests rather
+  than lowering the threshold.
 
 ## Tooling workflow
 
-- Use `task` for standard workflows (`task test`, `task test:race`, `task lint`,
-  `task fix`).
+- Use `task ci` as the single quality gate (format, tidy, lint, tests, coverage).
+  Supporting tasks: `task fmt`, `task fix`, `task test:race`.
 - Tools are managed in `tools/go.mod` and installed into `.tools/`.
 - Use `gopls` for navigation, diagnostics, and refactoring:
   - `gopls check <file>` before editing.

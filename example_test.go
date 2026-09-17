@@ -4,29 +4,22 @@ import (
 	"context"
 	"errors"
 	"fmt"
-	"time"
 
 	"github.com/paluszkiewiczB/popcorn"
 )
 
-// Example wires a finite importer module and a server module that depends on
-// it, runs the kernel until all tasks finish, and shows that the dependency
-// started first.
+// Example wires a setup module and a server module that depends on it. The
+// importer does its work inside Start, so the server starts only after the
+// import has finished, and the kernel runs until the context is canceled.
 func Example() {
-	// Records the order in which modules start.
 	started := make(chan string, 2)
 
-	// A finite module: it does its work and closes Done when finished.
-	done := make(chan struct{})
 	importer, err := popcorn.NewModule(popcorn.ModRecipe{
 		ID: "importer",
 		Start: func(context.Context) (popcorn.StopFunc, error) {
-			// ... import data ...
 			started <- "importer"
-			close(done)
 			return func(context.Context) error { return nil }, nil
 		},
-		Done: done, // Done makes this a TaskModule.
 	})
 	if err != nil {
 		fmt.Println("module:", err)
@@ -40,7 +33,6 @@ func Example() {
 	}
 	defer bus.Close()
 
-	// The kernel starts server only after importer's Start has returned.
 	server, err := popcorn.NewModule(popcorn.ModRecipe{
 		ID:           "server",
 		Dependencies: []string{"importer"},
@@ -60,16 +52,16 @@ func Example() {
 		return
 	}
 
-	ctx, cancel := context.WithTimeout(context.Background(), time.Second)
+	ctx, cancel := context.WithCancel(context.Background())
 	defer cancel()
+	done := make(chan error, 1)
+	go func() { done <- k.Start(ctx) }()
 
-	// A graceful stop is reported as ErrKernelStopped.
-	err = k.Start(ctx)
+	fmt.Println(<-started)
+	fmt.Println(<-started)
 
-	close(started)
-	for id := range started {
-		fmt.Println(id)
-	}
+	cancel()
+	err = <-done
 	fmt.Println(errors.Is(err, popcorn.ErrKernelStopped))
 
 	// Output:
@@ -114,7 +106,7 @@ func ExampleKernel_Start_canceled() {
 	done := make(chan error, 1)
 	go func() { done <- k.Start(ctx) }()
 
-	<-started // the kernel is up, so cancel is a clean shutdown
+	<-started
 	cancel()
 	err = <-done
 
@@ -173,7 +165,6 @@ func ExampleBus_Publisher() {
 	}
 	defer bus.Close()
 
-	// A probe subscribes to health reports.
 	health, err := bus.Subscribe("probe",
 		popcorn.WithBacklog(4),
 		popcorn.WithFilter(func(e popcorn.Event) bool {
@@ -186,7 +177,6 @@ func ExampleBus_Publisher() {
 		return
 	}
 
-	// The database module reports that it is healthy.
 	_ = bus.Publisher("database").Send(context.Background(), popcorn.NewEvent(
 		popcorn.ModuleStateChanged{To: popcorn.ModuleStateOK},
 	))
@@ -247,8 +237,6 @@ func ExampleKernel_Start() {
 	err = k.Start(context.Background())
 	fmt.Println("stopped:", errors.Is(err, popcorn.ErrKernelStopped))
 
-	// Start has returned, so the whole lifecycle is buffered. Close the
-	// subscription and drain it.
 	bus.Unsubscribe("probe")
 	for e := range states {
 		change, ok := e.Payload.(popcorn.KernelStateChanged)

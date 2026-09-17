@@ -24,7 +24,7 @@
 //			if err != nil {
 //				return nil, err
 //			}
-//			return popcorn.StopFuncFromCloser(conn), nil
+//			return popcorn.StopCloser(conn), nil
 //		},
 //	})
 //	if err != nil {
@@ -38,18 +38,22 @@
 //	return k.Start(ctx)
 //
 // [Kernel.Start] blocks until the context is canceled, a module fails to start,
-// a module reports itself unhealthy, or every [TaskModule] has finished.
+// a module reports itself unhealthy, or the kernel finishes its work (every
+// module is a [TaskModule] and all are done).
 //
 // # Modules
 //
 // A module has an id and a list of dependency ids. The kernel starts a module
-// only after every dependency's Start has returned, whether the dependency is
-// long-running or a finite TaskModule. A dependency is identified by id, and
-// the kernel rejects unknown, duplicate, self, and circular dependencies.
+// only after every dependency has completed: a plain module when its Start
+// returns, a [TaskModule] when its Done closes. A dependency is identified by
+// id, and the kernel rejects unknown, duplicate, self, and circular
+// dependencies.
 //
 // Setting [ModRecipe.Done] makes the module a TaskModule: one that performs
-// finite work and closes Done when it is finished. The kernel exits once there
-// is at least one TaskModule and all of them are done; see [WithExitWhenIdle].
+// finite work and closes Done when it is finished. Dependents wait for Done, so
+// a task gates startup by finishing. The kernel exits once every module is a
+// TaskModule and all are done; a graph with any long-running module runs until
+// the context is canceled or a module fails.
 //
 // # Events
 //
@@ -109,15 +113,17 @@
 // # Shutdown
 //
 // When a run ends, the kernel stops modules in waves, with every dependent
-// stopped before the dependencies it relies on. Each [StopFunc] receives a
-// shutdown context carved out of a shared budget; see [WithStopTimeout].
+// stopped before the dependencies it relies on. A [TaskModule] is the exception:
+// its [StopFunc] runs as soon as its Done closes, before its dependents. Each
+// shutdown stop receives a context carved out of a shared budget; see
+// [WithStopTimeout].
 // A [Bus] the kernel created itself is closed on shutdown; a Bus supplied with
 // [WithBus] is owned by the caller, who should close it with [Bus.Close].
 //
 // [Kernel.Start] returns:
 //
 //   - [ErrKernelStopped] (wrapped) after a graceful stop, whether ctx was
-//     canceled or the kernel became idle,
+//     canceled or the kernel finished its work,
 //   - a [KernelUnhealthyError] when a module reported NOK,
 //   - the error returned by a module's Start, when a module fails to start,
 //   - the joined errors from module StopFuncs, if any.

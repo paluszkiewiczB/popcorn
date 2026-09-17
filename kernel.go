@@ -18,7 +18,6 @@ const (
 )
 
 var (
-	errHealthTick  = errors.New("health tick must not be negative")
 	errStopTimeout = errors.New("stop timeout must not be negative")
 	errParallelism = errors.New("parallelism must not be negative")
 	errHealthGone  = errors.New("kernel health stream closed")
@@ -27,7 +26,7 @@ var (
 // Kernel manages the lifecycle of a set of Modules. It starts modules in
 // dependency order, publishes lifecycle events on the Bus, watches module
 // health, and shuts everything down when the context is canceled, a module
-// reports NOK, or all tasks finish.
+// reports NOK, or every module is a TaskModule that has finished.
 //
 // A Kernel runs once: after Start returns, it cannot be started again.
 type Kernel struct {
@@ -57,11 +56,13 @@ func NewKernel(opts ...KernelOption) (*Kernel, error) {
 }
 
 // Start starts modules in dependency order and blocks until ctx is canceled, a
-// module fails to start, a module reports NOK, or the kernel becomes idle. A
-// module starts once every dependency's Start has returned.
+// module fails to start, a module reports NOK, or the kernel finishes its work
+// (every module is a TaskModule and all are done). A module starts once every
+// dependency has completed: a plain Module when its Start returns, a TaskModule
+// when its Done closes.
 //
 // It returns a wrapped [ErrKernelStopped] after a graceful stop, whether ctx
-// was canceled or the kernel became idle, a [KernelUnhealthyError] when a
+// was canceled or the kernel finished its work, a [KernelUnhealthyError] when a
 // registered module reported NOK, the error from a module's Start when it fails,
 // or the joined errors from shutdown. A canceled stop also matches
 // [context.Canceled] (or [context.DeadlineExceeded]) through [errors.Is], so the
@@ -71,8 +72,6 @@ func (k *Kernel) Start(ctx context.Context) error {
 	if !k.begin() {
 		return ErrKernelStarted
 	}
-	// Derive a cancelable run context so modules whose Start ignores its own
-	// cancellation are released once the kernel has finished shutting down.
 	ctx, cancel := context.WithCancel(ctx)
 	defer cancel()
 
@@ -104,8 +103,6 @@ type moduleRun struct {
 	ready  chan struct{}
 	depth  int
 
-	// Guarded by kernelRun.kmu. stopOnce guarantees a module is stopped exactly
-	// once even if it finishes starting mid-shutdown.
 	started  bool
 	stop     StopFunc
 	order    int
@@ -139,15 +136,12 @@ type kernelRun struct {
 	failErr      error
 
 	wake chan struct{}
-
-	ticker *time.Ticker
 }
 
 func newKernelRun(ctx context.Context, cfg kernelConfig) (*kernelRun, error) {
 	b := cfg.bus
 	ownsBus := b == nil
 	if ownsBus {
-		// The kernel's own bus takes no options, so its construction cannot fail.
 		b = newBus(busConfig{log: cfg.log, replayBuffer: defaultHistoryCap})
 	}
 	run := &kernelRun{
@@ -172,26 +166,14 @@ func newKernelRun(ctx context.Context, cfg kernelConfig) (*kernelRun, error) {
 			return ok && msc.To == ModuleStateNOK
 		}))
 	if err != nil {
-		// Only a caller-supplied bus can fail here (a duplicate "kernel"
-		// subscription); a freshly built one is empty, so there is nothing to
-		// close and the caller owns teardown of the bus it supplied.
 		run.transition(ctx, KernelStateStopped, err)
 		return nil, err
 	}
 	run.health = health
-	if cfg.healthTick > 0 {
-		run.ticker = time.NewTicker(cfg.healthTick)
-	}
-	// Discard anything the subscribe-time replay seeded: no module has started
-	// yet, so every queued health event is either stale history or out-of-band.
 	run.drainHealth()
 	return run, nil
 }
 
-// drainHealth discards anything the subscribe-time replay seeded: no module has
-// started yet, so every queued health event is either stale history or
-// out-of-band. Draining by buffered length keeps the read path branch-free; a
-// torn-down stream would report zero length and end the drain.
 func (run *kernelRun) drainHealth() {
 	for len(run.health) > 0 {
 		<-run.health
@@ -222,10 +204,6 @@ func (run *kernelRun) indexModules(modules []Module) {
 	}
 }
 
-// assignDepths computes depth(m) = 0 for a module with no dependencies, else
-// 1 + max(depth(dep)). The graph is acyclic (validateModules rejects cycles), so
-// the memoized recursion terminates. Dependencies always have a strictly smaller
-// depth, so stopping in descending depth order is dependency-safe.
 func (run *kernelRun) assignDepths() {
 	depths := make(map[string]int, len(run.runs))
 	var visit func(id string) int
@@ -249,9 +227,6 @@ func (run *kernelRun) assignDepths() {
 	}
 }
 
-// buildStopLevels groups every module by depth. stopStarted walks the levels in
-// descending order, stopping a whole wave concurrently. Not-yet-started modules
-// are included; stopModule no-ops them.
 func (run *kernelRun) buildStopLevels() {
 	maxDepth := 0
 	for _, r := range run.runs {
@@ -266,12 +241,7 @@ func (run *kernelRun) buildStopLevels() {
 }
 
 func (run *kernelRun) close() {
-	if run.ticker != nil {
-		run.ticker.Stop()
-	}
 	if run.ownsBus {
-		// The kernel created this bus, so it owns its teardown and must reap the
-		// delivery goroutines of any subscription a module forgot to remove.
 		run.bus.Close()
 		return
 	}
@@ -299,13 +269,19 @@ func (run *kernelRun) startModule(ctx context.Context, r *moduleRun) {
 	run.recordStarted(ctx, r, stop, time.Since(start))
 }
 
-// waitDependencies parks until every dependency's Start has returned. A halt is
-// the kernel's single shutdown signal and is always closed before Start returns,
-// so cancellation reaches waiting modules through it.
 func (run *kernelRun) waitDependencies(r *moduleRun) bool {
 	for _, dep := range r.deps {
+		d := run.rts[dep]
 		select {
-		case <-run.rts[dep].ready:
+		case <-d.ready:
+		case <-run.halt:
+			return false
+		}
+		if d.task == nil {
+			continue
+		}
+		select {
+		case <-d.task.Done():
 		case <-run.halt:
 			return false
 		}
@@ -339,13 +315,8 @@ func (run *kernelRun) failure() error {
 	return run.failErr
 }
 
-// The last module to start moves the kernel to Running; a module that finishes
-// starting during shutdown is stopped right away instead.
 func (run *kernelRun) recordStarted(ctx context.Context, r *moduleRun, stop StopFunc, took time.Duration) {
-	doneAlready := run.markStarted(r, stop)
-	// r.order is unique per start, so exactly one module lands on the last
-	// position; only that one may publish Running. Deriving "last" from the
-	// order avoids the race where two finishing starts both observe allStarted.
+	run.markStarted(r, stop)
 	last := r.order == len(run.runs)-1
 
 	if !run.publishStart(ctx, r, took, last) {
@@ -355,38 +326,21 @@ func (run *kernelRun) recordStarted(ctx context.Context, r *moduleRun, stop Stop
 	}
 	close(r.ready)
 
-	if r.task != nil && !doneAlready {
-		go run.watchTask(r)
-	}
-	if run.isIdle() {
-		run.signalWake()
+	if r.task != nil {
+		go run.watchTask(ctx, r)
 	}
 }
 
-func (run *kernelRun) markStarted(r *moduleRun, stop StopFunc) bool {
+func (run *kernelRun) markStarted(r *moduleRun, stop StopFunc) {
 	run.kmu.Lock()
 	defer run.kmu.Unlock()
 	r.started = true
 	r.stop = stop
 	r.order = run.startedCount
 	run.startedCount++
-	doneAlready := r.task != nil && isClosed(r.task.Done())
-	if doneAlready {
-		run.doneTasks++
-	}
-	return doneAlready
 }
 
-func isClosed(ch <-chan struct{}) bool {
-	select {
-	case <-ch:
-		return true
-	default:
-		return false
-	}
-}
-
-func (run *kernelRun) watchTask(r *moduleRun) {
+func (run *kernelRun) watchTask(ctx context.Context, r *moduleRun) {
 	select {
 	case <-r.task.Done():
 	case <-run.halt:
@@ -398,15 +352,15 @@ func (run *kernelRun) watchTask(r *moduleRun) {
 	if run.isIdle() {
 		run.signalWake()
 	}
+	if err := run.stopModule(ctx, r, time.Now().Add(run.cfg.stopTimeout)); err != nil {
+		run.cfg.log.Warn("task stop failed", "module", r.id, "error", err)
+	}
 }
 
 func (run *kernelRun) isIdle() bool {
 	run.kmu.Lock()
 	defer run.kmu.Unlock()
-	if run.doneTasks != run.totalTasks || run.totalTasks == 0 {
-		return false
-	}
-	return run.cfg.exitWhenIdle || run.startedCount == len(run.runs)
+	return run.totalTasks > 0 && run.totalTasks == len(run.runs) && run.doneTasks == run.totalTasks
 }
 
 func (run *kernelRun) signalWake() {
@@ -436,11 +390,8 @@ func (run *kernelRun) wait(ctx context.Context) (loopEvent, Event, error) {
 		}
 		return eventIdle, Event{}, nil
 	case e := <-run.health:
-		// checkHealth at the top of the loop is the single place that detects a
-		// closed stream: a closed channel yields a zero Event that handleHealth
-		// ignores, and the next iteration ends the run with errHealthGone.
 		return eventHealth, e, nil
-	case <-run.tick():
+	case <-run.cfg.healthTick:
 		return eventTick, Event{}, nil
 	}
 }
@@ -450,8 +401,6 @@ func (run *kernelRun) loop(ctx context.Context) error {
 		if err := run.checkHealth(); err != nil {
 			return run.finish(ctx, err)
 		}
-		// Idleness is re-checked every iteration, after health, so a queued NOK
-		// can never be masked by an idle completion that won a select race.
 		if run.isIdle() {
 			return errors.Join(append(run.shutdown(ctx, nil),
 				fmt.Errorf("kernel finished its work: %w", ErrKernelStopped))...)
@@ -464,8 +413,6 @@ func (run *kernelRun) loop(ctx context.Context) error {
 	}
 }
 
-// Reports whether the loop should continue; when it should not, the returned error
-// is Start's result.
 func (run *kernelRun) handleEvent(ctx context.Context, event loopEvent, payload Event, err error) (bool, error) {
 	switch event {
 	case eventCanceled:
@@ -478,7 +425,6 @@ func (run *kernelRun) handleEvent(ctx context.Context, event loopEvent, payload 
 			return false, run.finish(ctx, herr)
 		}
 	case eventTick, eventIdle:
-		// Health and idleness are both re-checked at the top of the loop.
 	}
 	return true, nil
 }
@@ -487,15 +433,6 @@ func (run *kernelRun) finish(ctx context.Context, err error) error {
 	return errors.Join(append([]error{err}, run.shutdown(ctx, err)...)...)
 }
 
-// tick is nil when no health tick is configured, which disables the select case.
-func (run *kernelRun) tick() <-chan time.Time {
-	if run.ticker == nil {
-		return nil
-	}
-	return run.ticker.C
-}
-
-// A closed subscription is surfaced so the loop can stop instead of spinning.
 func (run *kernelRun) checkHealth() error {
 	for {
 		select {
@@ -513,8 +450,6 @@ func (run *kernelRun) checkHealth() error {
 }
 
 func (run *kernelRun) handleHealth(e Event) error {
-	// The health subscription filter admits only ModuleStateNOK payloads, so the
-	// type assertion is safe and no state re-check is needed here.
 	msc, _ := e.Payload.(ModuleStateChanged)
 	r, known := run.rts[e.Source()]
 	if !known {
@@ -523,10 +458,6 @@ func (run *kernelRun) handleHealth(e Event) error {
 	return KernelUnhealthyError{ModuleID: r.id, Cause: msc.Cause}
 }
 
-// transition publishes KernelStateChanged atomically with the state change, so the
-// delivered event order always matches the lifecycle order. Every caller issues
-// only a legal move: starting is published once at bootstrap, and shutdown is
-// the sole source of stopping/stopped, issued once from start to finish.
 func (run *kernelRun) transition(ctx context.Context, to KernelState, cause error) {
 	run.stateMu.Lock()
 	defer run.stateMu.Unlock()
@@ -566,10 +497,6 @@ func (run *kernelRun) stopStarted(ctx context.Context, deadline time.Time) []err
 			}
 			continue
 		}
-		// A module stuck in Start holds its start slot, so stops need their own
-		// capacity. Every stopModule is deadline-bounded, so waiting for a slot
-		// cannot outlive the shared deadline. A wave is joined before descending
-		// so a dependency is never stopped before its dependents.
 		var wg sync.WaitGroup
 		for _, r := range level {
 			wg.Go(func() {
@@ -583,11 +510,6 @@ func (run *kernelRun) stopStarted(ctx context.Context, deadline time.Time) []err
 	return errs
 }
 
-// stopModule runs a module's StopFunc at most once, bounded by deadline. The
-// StopFunc runs in its own goroutine so a StopFunc that ignores its context cannot
-// hang shutdown; in that case the StopFunc goroutine is abandoned. The started/stop
-// read happens before stopOnce so a module that has not started yet does not consume
-// the once; a later call after it finishes starting can still stop it.
 func (run *kernelRun) stopModule(ctx context.Context, r *moduleRun, deadline time.Time) error {
 	run.kmu.Lock()
 	stop, started := r.stop, r.started
@@ -610,10 +532,6 @@ func (run *kernelRun) stopModule(ctx context.Context, r *moduleRun, deadline tim
 	return err
 }
 
-// publishStart publishes ModuleStarted, and for the last module to start also
-// the Running transition, atomically under stateMu: a start can never be ordered
-// after a Stopping/Stopped transition. It reports false when shutdown has already
-// begun, so a late start cannot revive the kernel.
 func (run *kernelRun) publishStart(ctx context.Context, r *moduleRun, took time.Duration, last bool) bool {
 	run.stateMu.Lock()
 	defer run.stateMu.Unlock()
@@ -664,22 +582,19 @@ func WithModules(modules ...Module) KernelOption {
 	}
 }
 
-// WithHealthTick sets how often the kernel re-drains queued health events, in
-// addition to handling them as they arrive. The default is 0, which disables
-// the periodic re-check.
-func WithHealthTick(d time.Duration) KernelOption {
+// WithHealthTick injects a channel the kernel selects on to re-check health
+// periodically, in addition to handling events as they arrive. A nil channel
+// disables the check, which is the default. The caller owns the channel.
+func WithHealthTick(ch <-chan time.Time) KernelOption {
 	return func(cfg *kernelConfig) error {
-		if d < 0 {
-			return errHealthTick
-		}
-		cfg.healthTick = d
+		cfg.healthTick = ch
 		return nil
 	}
 }
 
-// WithStopTimeout sets the total shutdown budget shared by all module StopFuncs.
-// Each StopFunc receives a context carved out of this budget. The default is 5
-// seconds.
+// WithStopTimeout sets the total shutdown budget shared by the StopFuncs of the
+// shutdown waves. Each receives a context carved out of this budget; a
+// TaskModule stopped on completion gets a fresh budget. The default is 5 seconds.
 func WithStopTimeout(d time.Duration) KernelOption {
 	return func(cfg *kernelConfig) error {
 		if d < 0 {
@@ -692,9 +607,10 @@ func WithStopTimeout(d time.Duration) KernelOption {
 
 // WithParallelism caps how many modules start concurrently, and how many stop
 // concurrently within a wave. 1 is sequential; 0 (the default) means no cap.
-// Stops always run in descending dependency-depth waves: every dependent is
-// stopped before anything it depends on, while modules at the same depth stop
-// concurrently.
+// Stops run in descending dependency-depth waves: every dependent is stopped
+// before anything it depends on, while modules at the same depth stop
+// concurrently. A TaskModule whose Done closes is stopped immediately instead,
+// before its dependents.
 func WithParallelism(p int) KernelOption {
 	return func(cfg *kernelConfig) error {
 		if p < 0 {
@@ -705,26 +621,13 @@ func WithParallelism(p int) KernelOption {
 	}
 }
 
-// WithExitWhenIdle controls auto-shutdown. The kernel stops once there is at
-// least one TaskModule and every TaskModule is done. When true, this happens even
-// while long-running peers are still up. When false (the default), the kernel
-// additionally waits until every module has started, so a graph still coming up
-// is not cut short.
-func WithExitWhenIdle(v bool) KernelOption {
-	return func(cfg *kernelConfig) error {
-		cfg.exitWhenIdle = v
-		return nil
-	}
-}
-
 type kernelConfig struct {
-	bus          *Bus
-	log          *slog.Logger
-	modules      []Module
-	healthTick   time.Duration
-	stopTimeout  time.Duration
-	parallelism  int
-	exitWhenIdle bool
+	bus         *Bus
+	log         *slog.Logger
+	modules     []Module
+	healthTick  <-chan time.Time
+	stopTimeout time.Duration
+	parallelism int
 }
 
 func validateModules(modules []Module) error {

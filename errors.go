@@ -27,8 +27,9 @@ var (
 	// ErrKernelStarted is returned by Start when called on an already-started kernel.
 	ErrKernelStarted = errors.New("kernel already started")
 	// ErrKernelStopped is returned (wrapped) by Start after a graceful stop:
-	// either the caller's context was canceled or the kernel became idle.
-	// A canceled stop also matches context.Canceled via errors.Is.
+	// either the caller's context was canceled or the kernel finished its work
+	// (every module was a TaskModule and all were done). A canceled stop also
+	// matches context.Canceled via errors.Is.
 	ErrKernelStopped = errors.New("kernel stopped")
 )
 

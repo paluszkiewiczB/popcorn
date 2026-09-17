@@ -4,6 +4,7 @@ set: [pipefail]
 
 vars:
   TOOL_BIN: "{{.ROOT_DIR}}/.tools"
+  REQUIRED_CODE_COVERAGE: "100"
 
 env:
   GOTOOLCHAIN: go1.26.3+auto
@@ -24,13 +25,26 @@ tasks:
     cmds:
       - go test -count 1 -race -coverpkg=./... ./...
 
-  test:reports:
-    desc: "Print total code coverage"
+  covercheck:
+    desc: "Fail if total coverage is below REQUIRED_CODE_COVERAGE"
     preconditions:
       - test -f ./bin/coverage.out
     cmds:
-      - go tool cover -func=./bin/coverage.out | awk '/total/{gsub("%","",$3); print $3}' > ./bin/totalCoverageReport.txt
-      - echo "Total code coverage is $(cat ./bin/totalCoverageReport.txt)%"
+      - |
+        pct=$(go tool cover -func=./bin/coverage.out | awk '/^total:/{gsub("%","",$3); print $3}')
+        echo "coverage: ${pct}% (required: {{.REQUIRED_CODE_COVERAGE}}%)"
+        awk -v p="$pct" -v r="{{.REQUIRED_CODE_COVERAGE}}" \
+          'BEGIN { if (p+0 < r+0) { printf "FAIL: coverage %s%% below required %s%%\n", p, r; exit 1 } }'
+
+  ci:
+    desc: "Quality gate: format, tidy, lint, tests, coverage"
+    deps: [setup]
+    cmds:
+      - cmd: 'test -z "$({{.TOOL_BIN}}/gofumpt -l .)" || { echo "not gofumpted; run task fmt"; exit 1; }'
+      - go mod tidy -diff
+      - task: lint
+      - task: test
+      - task: covercheck
 
   deps:
     desc: "Download module dependencies"
@@ -43,6 +57,12 @@ tasks:
     cmds:
       - "{{.TOOL_BIN}}/golangci-lint run --fix ./..."
       - "go fix ./..."
+
+  fmt:
+    desc: "Format with gofumpt"
+    deps: [tools]
+    cmds:
+      - "{{.TOOL_BIN}}/gofumpt -l -w ."
 
   lint:
     desc: "Run linters"

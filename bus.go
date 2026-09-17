@@ -23,10 +23,10 @@ var (
 // Bus is an in-process event bus. It fans every event out to all matching
 // subscriptions and is the single communication mechanism between modules.
 //
-// Each subscription has its own buffer, and Send never waits for a reader. A
-// buffered subscription drops its oldest event when full; an unbuffered one
-// drops events a stalled consumer cannot keep up with. A slow subscriber can
-// only overflow its own subscription. See [WithBacklog] and [WithReplayBuffer].
+// Each subscription is a bounded channel. Send never waits for a reader: when a
+// subscription's buffer is full, its oldest event is dropped. A slow subscriber
+// can only overflow its own subscription. See [WithBacklog] and
+// [WithReplayBuffer].
 type Bus struct {
 	cfg busConfig
 
@@ -48,9 +48,6 @@ func NewBus(opts ...BusOption) (*Bus, error) {
 	return newBus(cfg), nil
 }
 
-// newBus builds a Bus from an already-resolved config. Unlike NewBus it cannot
-// fail, so callers that assemble the config directly (the Kernel's own bus) need
-// no error path.
 func newBus(cfg busConfig) *Bus {
 	if cfg.log == nil {
 		cfg.log = discardLogger()
@@ -69,10 +66,10 @@ func newBus(cfg busConfig) *Bus {
 // channel. The Bus owns the channel: it is the only writer and the only closer,
 // so a consumer can read it until [Bus.Close] or [Bus.Unsubscribe].
 //
-// The channel buffers up to the [WithBacklog] size, 0 by default. A buffered
-// subscription created after events have already been sent is first seeded with
-// matching history, capped by the backlog, so a late subscriber can catch up; an
-// unbuffered subscription is never seeded. See [WithReplayBuffer].
+// The channel buffers up to the [WithBacklog] size, a minimum of one event by
+// default, and drops its oldest event when full. A subscription created after
+// events have already been sent is first seeded with matching history, capped by
+// the buffer size, so a late subscriber can catch up. See [WithReplayBuffer].
 //
 // id identifies the subscription and is the value [Publisher.Send] compares
 // against [Event.Source] to skip a publisher's own subscription.
@@ -96,16 +93,8 @@ func (b *Bus) Subscribe(id string, opts ...SubOption) (<-chan Event, error) {
 		return nil, fmt.Errorf("%w: %q", errSubscriptionExists, id)
 	}
 
-	ch := make(chan Event, cfg.backlog)
+	ch := make(chan Event, max(1, cfg.backlog))
 	s := &subscription{id: id, ch: ch, filter: guardFilter(cfg.filter, b.cfg.log)}
-	if cfg.backlog == 0 {
-		s.handoff = make(chan Event)
-		s.abort = make(chan struct{})
-		s.done = make(chan struct{})
-		s.stopped = make(chan struct{})
-		s.waiting = true
-		go s.cap0Loop()
-	}
 	b.seed(s)
 	b.subs[id] = s
 	return ch, nil
@@ -142,18 +131,7 @@ func (b *Bus) Close() {
 	}
 }
 
-// Caller must hold b.mu so no Send can be enqueuing concurrently.
 func (s *subscription) teardown() {
-	if s.unbuffered() {
-		s.mu.Lock()
-		if !s.closed {
-			s.closed = true
-			close(s.done)
-			s.abortLocked()
-		}
-		s.mu.Unlock()
-		<-s.stopped
-	}
 	close(s.ch)
 }
 
@@ -168,7 +146,7 @@ func (b *Bus) Publisher(id string) *Publisher {
 }
 
 func (b *Bus) seed(s *subscription) {
-	if s.unbuffered() || len(b.history) == 0 {
+	if len(b.history) == 0 {
 		return
 	}
 	backlog := cap(s.ch)
@@ -187,8 +165,6 @@ func (b *Bus) seed(s *subscription) {
 	}
 }
 
-// remember writes e into the fixed-length history ring in O(1). The ring is
-// empty when replay is disabled, in which case nothing is retained.
 func (b *Bus) remember(e Event) {
 	if len(b.history) == 0 {
 		return
@@ -203,17 +179,6 @@ func (b *Bus) remember(e Event) {
 }
 
 func (s *subscription) offer(e Event) {
-	if s.unbuffered() {
-		s.offerRendezvous(e)
-		return
-	}
-	s.offerBuffered(e)
-}
-
-func (s *subscription) unbuffered() bool { return cap(s.ch) == 0 }
-
-// The Bus is the only writer, so a full ring always has room after one eviction.
-func (s *subscription) offerBuffered(e Event) {
 	select {
 	case s.ch <- e:
 		return
@@ -224,105 +189,6 @@ func (s *subscription) offerBuffered(e Event) {
 	default:
 	}
 	s.ch <- e
-}
-
-// Holds at most one queued event next to the in-flight hand-off. A third pending
-// event aborts the hand-off and sheds until a reader catches up.
-func (s *subscription) offerRendezvous(e Event) {
-	s.mu.Lock()
-	if len(s.inbox) == 0 && s.waiting && !s.handoffClaimed {
-		// The delivery goroutine is idle: hand over synchronously. The claim flag
-		// keeps a second send from racing the receiver's reset.
-		s.waiting = false
-		s.handoffClaimed = true
-		s.mu.Unlock()
-		select {
-		case s.handoff <- e:
-		case <-s.done:
-		}
-		return
-	}
-	if len(s.inbox) > 0 {
-		s.shedding = true
-		s.abortLocked()
-	}
-	s.inbox = append(s.inbox[:0], e)
-	s.mu.Unlock()
-}
-
-// abortLocked is only ever reached under s.mu with a fresh abort channel: every
-// call replaces the one it closes, and teardown runs at most once.
-func (s *subscription) abortLocked() {
-	close(s.abort)
-	s.abort = make(chan struct{})
-}
-
-func (s *subscription) cap0Loop() {
-	defer close(s.stopped)
-	for {
-		e, abort, ok := s.nextRendezvous()
-		if !ok {
-			return
-		}
-		if s.isShedding() {
-			select {
-			case s.ch <- e:
-				s.setShedding(false)
-			default:
-			}
-			continue
-		}
-		select {
-		case s.ch <- e:
-		case <-abort:
-			s.setShedding(true)
-		}
-	}
-}
-
-// Discards the queued event too; it belongs to the burst the reader fell behind on.
-func (s *subscription) setShedding(v bool) {
-	s.mu.Lock()
-	s.shedding = v
-	if !v {
-		s.inbox = s.inbox[:0]
-	}
-	s.mu.Unlock()
-}
-
-func (s *subscription) isShedding() bool {
-	s.mu.Lock()
-	defer s.mu.Unlock()
-	return s.shedding
-}
-
-func (s *subscription) nextRendezvous() (Event, chan struct{}, bool) {
-	s.mu.Lock()
-	if len(s.inbox) > 0 {
-		e := s.inbox[0]
-		s.inbox = s.inbox[:0]
-		abort := s.abort
-		s.mu.Unlock()
-		return e, abort, true
-	}
-	if s.closed {
-		s.mu.Unlock()
-		return Event{}, nil, false
-	}
-	s.waiting = true
-	s.mu.Unlock()
-
-	select {
-	case e := <-s.handoff:
-		s.mu.Lock()
-		s.waiting = false
-		s.handoffClaimed = false
-		abort := s.abort
-		s.mu.Unlock()
-		return e, abort, true
-	case <-s.done:
-		return Event{}, nil, false
-	}
 }
 
 // Publisher sends events on behalf of a single id. The Bus creates it via
@@ -361,8 +227,6 @@ func (p *Publisher) Send(ctx context.Context, e Event) error {
 			continue
 		}
 		b.mu.Lock()
-		// Identity, not id: the same id may have been torn down and resubscribed
-		// while the filter ran, and offering to the torn-down ring would panic.
 		if live := b.subs[s.id]; live == s {
 			s.offer(e)
 		}
@@ -374,10 +238,10 @@ func (p *Publisher) Send(ctx context.Context, e Event) error {
 // BusOption configures a Bus.
 type BusOption func(*busConfig) error
 
-// WithReplayBuffer sets how many recent events the Bus retains so that a
-// subscription created later can be seeded with matching history. The default is
-// 64; 0 disables replay; a negative n errors. A subscription is seeded up to its
-// [WithBacklog] size, so an unbuffered subscription is never seeded.
+// WithReplayBuffer sets how many recent events the Bus retains to seed a
+// subscription created later. The default is 64; 0 disables replay; a negative n
+// errors. A subscription is seeded up to its buffer size, which is at least one
+// event.
 func WithReplayBuffer(n int) BusOption {
 	return func(cfg *busConfig) error {
 		if n < 0 {
@@ -388,8 +252,8 @@ func WithReplayBuffer(n int) BusOption {
 	}
 }
 
-// WithBusLogger sets the logger for internal diagnostics, currently only
-// panicking event filters. A nil logger is replaced by a discarding logger.
+// WithBusLogger sets the logger for internal Bus diagnostics. A nil logger
+// discards them.
 func WithBusLogger(l *slog.Logger) BusOption {
 	return func(cfg *busConfig) error {
 		cfg.log = l
@@ -400,11 +264,11 @@ func WithBusLogger(l *slog.Logger) BusOption {
 // SubOption configures a single subscription.
 type SubOption func(*subConfig) error
 
-// WithBacklog sets the subscription's buffer size. A buffered subscription never
-// blocks Send; when it is full, its oldest buffered event is dropped. The default
-// is 0, an unbuffered subscription that drops events under a burst rather than
-// queueing them. WithBacklog also caps how many history events are replayed at
-// subscribe time.
+// WithBacklog sets the subscription's buffer size. A subscription never blocks
+// Send; when full, its oldest buffered event is dropped. The default is 0, which
+// means a single-event buffer, the minimum. WithBacklog also caps how many
+// history events are replayed at subscribe time; the buffer is at least one
+// event.
 func WithBacklog(n int) SubOption {
 	return func(cfg *subConfig) error {
 		if n < 0 {
@@ -428,8 +292,6 @@ func WithFilter(f func(Event) bool) SubOption {
 	}
 }
 
-// guardFilter wraps f so a panicking filter drops the event instead of taking down
-// Send. The panic is logged: it is always a bug in caller code.
 func guardFilter(f func(Event) bool, log *slog.Logger) func(Event) bool {
 	if f == nil {
 		return nil
@@ -459,16 +321,4 @@ type subscription struct {
 	id     string
 	ch     chan Event
 	filter func(Event) bool
-
-	// Rendezvous (cap-0) delivery state.
-	mu             sync.Mutex
-	inbox          []Event
-	handoff        chan Event
-	waiting        bool
-	handoffClaimed bool
-	shedding       bool
-	abort          chan struct{}
-	done           chan struct{}
-	stopped        chan struct{}
-	closed         bool
 }

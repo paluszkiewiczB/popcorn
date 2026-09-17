@@ -16,7 +16,6 @@ import (
 	"github.com/paluszkiewiczB/popcorn"
 )
 
-// stopped marks a module as stopped when its StopFunc runs.
 func stopped(ch chan<- string, id string) popcorn.StopFunc {
 	return func(context.Context) error {
 		ch <- id
@@ -24,8 +23,6 @@ func stopped(ch chan<- string, id string) popcorn.StopFunc {
 	}
 }
 
-// concurrentStop returns a StopFunc that blocks until its paired StopFunc has
-// entered; a wave can only complete if its modules stop concurrently.
 func concurrentStop(entered *sync.WaitGroup) popcorn.StopFunc {
 	return func(context.Context) error {
 		entered.Done()
@@ -34,9 +31,6 @@ func concurrentStop(entered *sync.WaitGroup) popcorn.StopFunc {
 	}
 }
 
-// healthStart binds a publisher to id and reports a health transition whose
-// payload is the framework-owned ModuleStateChanged type; the Kind is derived
-// from that type, which is the only health convention the kernel may rely on.
 func healthStart(
 	id string,
 	b *popcorn.Bus,
@@ -52,18 +46,11 @@ func healthStart(
 	}
 }
 
-// observation is what the pre-start observer sees on the bus.
 type observation struct {
-	// starts are ModuleStarted payloads in arrival order.
-	starts []popcorn.ModuleStarted
-	// transitions are KernelStateChanged payloads in arrival order.
+	starts      []popcorn.ModuleStarted
 	transitions []popcorn.KernelStateChanged
 }
 
-// startObserver subscribes to the bus before Kernel.Start so every
-// ModuleStarted and KernelStateChanged is captured (backlog seeds the
-// subscription even for events emitted while starting). It returns the whole
-// lifecycle up to the terminal Stopped transition.
 func startObserver(b *popcorn.Bus, out chan<- observation) {
 	ch, err := b.Subscribe("observe", popcorn.WithBacklog(32), popcorn.WithFilter(func(e popcorn.Event) bool {
 		switch e.Payload.(type) {
@@ -93,7 +80,6 @@ func startObserver(b *popcorn.Bus, out chan<- observation) {
 	}
 }
 
-// waitRunning blocks until a kernel reached KernelStateRunning on b.
 func waitRunning(is *is.I, b *popcorn.Bus) {
 	signaled := make(chan bool, 1)
 	go func() {
@@ -112,7 +98,7 @@ func waitRunning(is *is.I, b *popcorn.Bus) {
 	}()
 
 	if !mustBool(is, signaled) {
-		is.Fail() // kernel never reached Running
+		is.Fail()
 	}
 }
 
@@ -127,7 +113,6 @@ func mustBool(is *is.I, ch <-chan bool) bool {
 	}
 }
 
-// closeOnStart returns an already-closed channel: the TaskModule is "done".
 func closeOnStart() chan struct{} {
 	done := make(chan struct{})
 	close(done)
@@ -214,35 +199,28 @@ func TestKernelValidation(t *testing.T) {
 		t.Parallel()
 		is := is.New(t)
 		_, err := popcorn.NewKernel(popcorn.WithParallelism(-1))
-		is.True(err != nil) // parallelism must not be negative
-	})
-
-	t.Run("negative health tick rejected", func(t *testing.T) {
-		t.Parallel()
-		is := is.New(t)
-		_, err := popcorn.NewKernel(popcorn.WithHealthTick(-1))
-		is.True(err != nil) // a negative tick must be rejected
+		is.True(err != nil)
 	})
 
 	t.Run("negative stop timeout rejected", func(t *testing.T) {
 		t.Parallel()
 		is := is.New(t)
 		_, err := popcorn.NewKernel(popcorn.WithStopTimeout(-1))
-		is.True(err != nil) // a negative stop budget must be rejected
+		is.True(err != nil)
 	})
 
 	t.Run("logger option accepted", func(t *testing.T) {
 		t.Parallel()
 		is := is.New(t)
 		_, err := popcorn.NewKernel(popcorn.WithLogger(slog.New(slog.DiscardHandler)))
-		is.NoErr(err) // a logger must be settable on the kernel
+		is.NoErr(err)
 	})
 
-	t.Run("tiny health tick accepted", func(t *testing.T) {
+	t.Run("health tick channel accepted", func(t *testing.T) {
 		t.Parallel()
 		is := is.New(t)
-		_, err := popcorn.NewKernel(popcorn.WithHealthTick(time.Millisecond))
-		is.NoErr(err) // small positive tick must be constructible
+		_, err := popcorn.NewKernel(popcorn.WithHealthTick(make(chan time.Time)))
+		is.NoErr(err)
 	})
 }
 
@@ -278,7 +256,7 @@ func TestKernelLifecycle(t *testing.T) {
 					popcorn.KernelStateRunning,
 					popcorn.KernelStateStopping,
 					popcorn.KernelStateStopped,
-				}, statesOf(o.transitions)) // full lifecycle transitions must be published
+				}, statesOf(o.transitions))
 
 				ids := make([]string, len(o.starts))
 				orders := make([]int, len(o.starts))
@@ -286,10 +264,10 @@ func TestKernelLifecycle(t *testing.T) {
 					ids[i] = ms.ID
 					orders[i] = ms.Order
 				}
-				is.Equal(ids, []string{taskID}) // the module's start must be announced
-				is.Equal(orders, []int{0})      // and be the first start
+				is.Equal(ids, []string{taskID})
+				is.Equal(orders, []int{0})
 			case <-time.After(never):
-				is.Fail() // lifecycle events never observed
+				is.Fail()
 			}
 		})
 	})
@@ -315,9 +293,9 @@ func TestKernelLifecycle(t *testing.T) {
 			ctx, cancel := within()
 			defer cancel()
 
-			is.True(errors.Is(k.Start(ctx), popcorn.ErrKernelStopped)) // all-task kernel exits gracefully
+			is.True(errors.Is(k.Start(ctx), popcorn.ErrKernelStopped))
 
-			is.True(errors.Is(k.Start(ctx), popcorn.ErrKernelStarted)) // second Start must be rejected
+			is.True(errors.Is(k.Start(ctx), popcorn.ErrKernelStarted))
 		})
 	})
 
@@ -326,7 +304,6 @@ func TestKernelLifecycle(t *testing.T) {
 		synctest.Test(t, func(t *testing.T) {
 			is := is.New(t)
 
-			// With no bus configured the kernel creates one itself.
 			task, err := popcorn.NewModule(popcorn.ModRecipe{
 				ID:   taskID,
 				Done: closeOnStart(),
@@ -342,11 +319,11 @@ func TestKernelLifecycle(t *testing.T) {
 			ctx, cancel := within()
 			defer cancel()
 
-			is.True(errors.Is(k.Start(ctx), popcorn.ErrKernelStopped)) // default bus must work end to end
+			is.True(errors.Is(k.Start(ctx), popcorn.ErrKernelStopped))
 		})
 	})
 
-	t.Run("health tick drives a long-running loop", func(t *testing.T) {
+	t.Run("health tick wakes a long-running loop", func(t *testing.T) {
 		t.Parallel()
 		synctest.Test(t, func(t *testing.T) {
 			is := is.New(t)
@@ -355,10 +332,9 @@ func TestKernelLifecycle(t *testing.T) {
 			m, err := popcorn.NewModule(popcorn.ModRecipe{ID: "m", Start: noopStart})
 			is.NoErr(err)
 
-			// A non-task module keeps the kernel up until canceled, so the health
-			// ticker is the only thing waking the loop.
+			tick := make(chan time.Time, 1)
 			k, err := popcorn.NewKernel(popcorn.WithBus(b),
-				popcorn.WithHealthTick(time.Millisecond),
+				popcorn.WithHealthTick(tick),
 				popcorn.WithModules(m))
 			is.NoErr(err)
 
@@ -368,12 +344,13 @@ func TestKernelLifecycle(t *testing.T) {
 			go func() { done <- k.Start(ctx) }()
 			waitRunning(is, b)
 
-			time.Sleep(5 * time.Millisecond) // let several health ticks fire
+			tick <- time.Now()
+			time.Sleep(time.Millisecond)
 			cancel()
 
 			err = <-done
-			is.True(errors.Is(err, context.Canceled))         // a canceled run returns the context error
-			is.True(errors.Is(err, popcorn.ErrKernelStopped)) // and is reported as a graceful stop
+			is.True(errors.Is(err, context.Canceled))
+			is.True(errors.Is(err, popcorn.ErrKernelStopped))
 		})
 	})
 }
@@ -423,31 +400,29 @@ func TestKernelStartOrder(t *testing.T) {
 					orders = append(orders, ms.Order)
 					took = append(took, ms.StartTook)
 				}
-				is.Equal(got, []string{"a", "b", "c"})                       // start order must follow dependencies
-				is.Equal(orders, []int{0, 1, 2})                             // Order must be the start position
-				is.Equal(took, []time.Duration{10 * time.Millisecond, 0, 0}) // StartTook must measure the Start body
+				is.Equal(got, []string{"a", "b", "c"})
+				is.Equal(orders, []int{0, 1, 2})
+				is.Equal(took, []time.Duration{10 * time.Millisecond, 0, 0})
 			case <-time.After(never):
-				is.Fail() // ModuleStarted events never observed
+				is.Fail()
 			}
 		})
 	})
 
-	t.Run("a task dependency is ready when Start returns", func(t *testing.T) {
+	t.Run("a task dependency is ready when Done closes", func(t *testing.T) {
 		t.Parallel()
 		synctest.Test(t, func(t *testing.T) {
 			is := is.New(t)
 
 			b := newBus(t, popcorn.WithReplayBuffer(8))
 
-			// The dependency's Done stays open: readiness must be Start-return, not
-			// Done, or the dependent never runs and the kernel deadlocks.
-			openDone := make(chan struct{})
+			done := make(chan struct{})
 			dependentStarted := make(chan struct{})
 
-			dep, err := popcorn.NewModule(popcorn.ModRecipe{ID: depID, Done: openDone, Start: noopStart})
+			dep, err := popcorn.NewModule(popcorn.ModRecipe{ID: depID, Done: done, Start: noopStart})
 			is.NoErr(err)
 			dep2, err := popcorn.NewModule(popcorn.ModRecipe{
-				ID: "dep2", Done: openDone, Dependencies: []string{depID},
+				ID: "dep2", Dependencies: []string{depID},
 				Start: func(context.Context) (popcorn.StopFunc, error) {
 					close(dependentStarted)
 					return noStop, nil
@@ -461,12 +436,21 @@ func TestKernelStartOrder(t *testing.T) {
 
 			ctx, cancel := context.WithCancel(context.Background())
 			defer cancel()
-			done := make(chan error, 1)
-			go func() { done <- k.Start(ctx) }()
+			go func() { _ = k.Start(ctx) }()
 
-			<-dependentStarted // only closes if Start-return gates readiness
+			select {
+			case <-dependentStarted:
+				is.Fail()
+			case <-time.After(10 * time.Millisecond):
+			}
+
+			close(done)
+			select {
+			case <-dependentStarted:
+			case <-time.After(never):
+				is.Fail()
+			}
 			cancel()
-			<-done
 		})
 	})
 
@@ -507,7 +491,7 @@ func TestKernelStartOrder(t *testing.T) {
 			done := make(chan error, 1)
 			go func() { done <- k.Start(ctx) }()
 
-			is.Equal(<-dependentReady, true) // parallel start must still wait for Start to return
+			is.Equal(<-dependentReady, true)
 			cancel()
 			<-done
 		})
@@ -520,10 +504,6 @@ func TestKernelStartOrder(t *testing.T) {
 
 			b := newBus(t, popcorn.WithReplayBuffer(8))
 
-			// Each start waits until the other has entered, so the pair can only
-			// make progress if the kernel runs them concurrently; serialized
-			// starts block forever and synctest reports the deadlock. No
-			// wall-clock timeout is involved.
 			var entered sync.WaitGroup
 			entered.Add(2)
 			start := func(context.Context) (popcorn.StopFunc, error) {
@@ -548,10 +528,10 @@ func TestKernelStartOrder(t *testing.T) {
 			done := make(chan error, 1)
 			go func() { done <- k.Start(ctx) }()
 
-			entered.Wait() // returns only once both starts ran concurrently
+			entered.Wait()
 			cancel()
 
-			is.True(errors.Is(<-done, context.Canceled)) // a canceled run returns the context error
+			is.True(errors.Is(<-done, context.Canceled))
 		})
 	})
 }
@@ -594,25 +574,23 @@ func TestKernelFailures(t *testing.T) {
 
 			err = k.Start(ctx)
 
-			is.True(errors.Is(err, failErr)) // the start failure must surface
+			is.True(errors.Is(err, failErr))
 			select {
 			case id := <-stops:
-				is.Equal(id, "earlier") // already-started modules must be stopped on failure
+				is.Equal(id, "earlier")
 			case <-time.After(never):
-				is.Fail() // earlier modules were not stopped on failed startup
+				is.Fail()
 			}
 		})
 	})
 
-	t.Run("long-running module without ExitWhenIdle runs until canceled", func(t *testing.T) {
+	t.Run("long-running module runs until canceled", func(t *testing.T) {
 		t.Parallel()
 		synctest.Test(t, func(t *testing.T) {
 			is := is.New(t)
 
 			b := newBus(t, popcorn.WithReplayBuffer(8))
 
-			// The run is synchronized on the module body signaling Start - no
-			// guess-sleeps: cancel exactly when the kernel is up.
 			started := make(chan bool, 1)
 			longMod, err := popcorn.NewModule(popcorn.ModRecipe{
 				ID: "long",
@@ -633,16 +611,16 @@ func TestKernelFailures(t *testing.T) {
 			go func() { stopped <- k.Start(ctx) }()
 
 			if !mustBool(is, started) {
-				is.Fail() // long-running module never started
+				is.Fail()
 			}
 			cancel()
 
 			select {
 			case err := <-stopped:
-				is.True(errors.Is(err, context.Canceled))         // ctx cancel must surface as the context error
-				is.True(errors.Is(err, popcorn.ErrKernelStopped)) // a canceled stop is still a graceful stop
+				is.True(errors.Is(err, context.Canceled))
+				is.True(errors.Is(err, popcorn.ErrKernelStopped))
 			case <-time.After(never):
-				is.Fail() // kernel did not stop after ctx cancel
+				is.Fail()
 			}
 		})
 	})
@@ -669,7 +647,7 @@ func TestKernelFailures(t *testing.T) {
 
 			err = k.Start(ctx)
 			unhealthy, ok := errors.AsType[popcorn.KernelUnhealthyError](err)
-			is.True(ok) // NOK report must stop the kernel
+			is.True(ok)
 			is.Equal(unhealthy.ModuleID, "sick")
 			is.True(errors.Is(unhealthy.Cause, errDiskFull))
 		})
@@ -709,8 +687,6 @@ func TestKernelFailures(t *testing.T) {
 
 			<-started
 
-			// A genuine NOK after the benign reports must still stop the kernel:
-			// had OK/TempNOK stopped it, this could not happen.
 			is.NoErr(b.Publisher("flappy").Send(ctx, popcorn.NewEvent(popcorn.ModuleStateChanged{
 				To:    popcorn.ModuleStateNOK,
 				Cause: errDiskFull,
@@ -718,7 +694,7 @@ func TestKernelFailures(t *testing.T) {
 
 			err = <-done
 			unhealthy, ok := errors.AsType[popcorn.KernelUnhealthyError](err)
-			is.True(ok) // benign health must not stop the kernel
+			is.True(ok)
 			is.Equal(unhealthy.ModuleID, "flappy")
 			is.True(errors.Is(unhealthy.Cause, errDiskFull))
 		})
@@ -736,9 +712,6 @@ func TestKernelFailures(t *testing.T) {
 				ID: "flappy",
 				Start: func(ctx context.Context) (popcorn.StopFunc, error) {
 					pub := b.Publisher("flappy")
-					// Far more benign transitions than the kernel's health
-					// backlog: if any of them were consumed they could evict
-					// the later NOK, so the NOK must never be lost.
 					for range 20 {
 						_ = pub.Send(ctx, popcorn.NewEvent(popcorn.ModuleStateChanged{To: popcorn.ModuleStateOK}))
 						_ = pub.Send(ctx, popcorn.NewEvent(popcorn.ModuleStateChanged{To: popcorn.ModuleStateTempNOK}))
@@ -765,7 +738,7 @@ func TestKernelFailures(t *testing.T) {
 
 			err = <-done
 			unhealthy, ok := errors.AsType[popcorn.KernelUnhealthyError](err)
-			is.True(ok) // a NOK after benign volume must still be actioned
+			is.True(ok)
 			is.Equal(unhealthy.ModuleID, "flappy")
 			is.True(errors.Is(unhealthy.Cause, errDiskFull))
 		})
@@ -791,12 +764,10 @@ func TestKernelFailures(t *testing.T) {
 			go func() { done <- k.Start(ctx) }()
 			waitRunning(is, b)
 
-			// A NOK from an unregistered id must be ignored...
 			is.NoErr(b.Publisher("not-a-module").Send(ctx, popcorn.NewEvent(popcorn.ModuleStateChanged{
 				To:    popcorn.ModuleStateNOK,
 				Cause: errSpoof,
 			})))
-			// ...so a subsequent genuine NOK still stops the kernel with the real id.
 			is.NoErr(b.Publisher("long").Send(ctx, popcorn.NewEvent(popcorn.ModuleStateChanged{
 				To:    popcorn.ModuleStateNOK,
 				Cause: errDiskFull,
@@ -805,7 +776,7 @@ func TestKernelFailures(t *testing.T) {
 			err = <-done
 			unhealthy, ok := errors.AsType[popcorn.KernelUnhealthyError](err)
 			is.True(ok)
-			is.Equal(unhealthy.ModuleID, "long") // the spoofed source must be ignored
+			is.Equal(unhealthy.ModuleID, "long")
 			is.True(errors.Is(unhealthy.Cause, errDiskFull))
 		})
 	})
@@ -832,13 +803,13 @@ func TestKernelHealthLoss(t *testing.T) {
 			go func() { done <- k.Start(ctx) }()
 			waitRunning(is, b)
 
-			b.Close() // yanking the health subscription must not spin the loop
+			b.Close()
 
 			select {
 			case err := <-done:
-				is.True(!errors.Is(err, popcorn.ErrKernelStopped)) // losing health is a failure, not a graceful stop
+				is.True(!errors.Is(err, popcorn.ErrKernelStopped))
 			case <-time.After(never):
-				is.Fail() // Start did not return after the bus closed
+				is.Fail()
 			}
 		})
 	})
@@ -849,7 +820,6 @@ func TestKernelHealthLoss(t *testing.T) {
 			is := is.New(t)
 
 			b := newBus(t, popcorn.WithReplayBuffer(8))
-			// A stale NOK lands in the bus history before the kernel even exists.
 			is.NoErr(b.Publisher("sick").Send(context.Background(), popcorn.NewEvent(popcorn.ModuleStateChanged{
 				To:    popcorn.ModuleStateNOK,
 				Cause: errDiskFull,
@@ -865,12 +835,12 @@ func TestKernelHealthLoss(t *testing.T) {
 
 			done := make(chan error, 1)
 			go func() { done <- k.Start(ctx) }()
-			waitRunning(is, b) // reaching Running already proves the replayed NOK was ignored
+			waitRunning(is, b)
 
 			cancel()
 			err = <-done
 			_, isUnhealthy := errors.AsType[popcorn.KernelUnhealthyError](err)
-			is.True(!isUnhealthy) // replayed health must not stop a fresh kernel
+			is.True(!isUnhealthy)
 			is.True(errors.Is(err, context.Canceled))
 		})
 	})
@@ -890,7 +860,7 @@ func TestKernelStop(t *testing.T) {
 				ID: "m",
 				Start: func(context.Context) (popcorn.StopFunc, error) {
 					return func(stopCtx context.Context) error {
-						checks <- stopCtx.Value(key{}) == "value" // values from the run context survive
+						checks <- stopCtx.Value(key{}) == "value"
 						return nil
 					}, nil
 				},
@@ -911,7 +881,7 @@ func TestKernelStop(t *testing.T) {
 			select {
 			case <-done:
 			case <-time.After(never):
-				is.Fail() // kernel did not stop after cancel
+				is.Fail()
 			}
 		})
 	})
@@ -929,7 +899,7 @@ func TestKernelStop(t *testing.T) {
 				Start: func(context.Context) (popcorn.StopFunc, error) { return stopped(stops, "m1"), nil },
 			})
 			m2, _ := popcorn.NewModule(popcorn.ModRecipe{
-				ID: "m2", Done: closeOnStart(),
+				ID:    "m2",
 				Start: func(context.Context) (popcorn.StopFunc, error) { return stopped(stops, "m2"), nil },
 			})
 
@@ -945,10 +915,59 @@ func TestKernelStop(t *testing.T) {
 
 			select {
 			case id := <-stops:
-				is.Equal(id, "m1")      // the dependent stops before its dependency
-				is.Equal(<-stops, "m2") // then the dependency it relies on
+				is.Equal(id, "m1")
+				is.Equal(<-stops, "m2")
 			case <-time.After(never):
-				is.Fail() // stop functions never ran
+				is.Fail()
+			}
+		})
+	})
+
+	t.Run("a finished task is stopped on completion", func(t *testing.T) {
+		t.Parallel()
+		synctest.Test(t, func(t *testing.T) {
+			is := is.New(t)
+
+			b := newBus(t, popcorn.WithReplayBuffer(8))
+			stops := make(chan string, 2)
+			done := make(chan struct{})
+
+			task, err := popcorn.NewModule(popcorn.ModRecipe{
+				ID: taskID, Done: done,
+				Start: func(context.Context) (popcorn.StopFunc, error) { return stopped(stops, taskID), nil },
+			})
+			is.NoErr(err)
+			peer, err := popcorn.NewModule(popcorn.ModRecipe{ID: peerID, Start: noopStart})
+			is.NoErr(err)
+
+			k, err := popcorn.NewKernel(popcorn.WithBus(b), popcorn.WithModules(task, peer))
+			is.NoErr(err)
+
+			ctx, cancel := context.WithCancel(context.Background())
+			defer cancel()
+			run := make(chan error, 1)
+			go func() { run <- k.Start(ctx) }()
+			waitRunning(is, b)
+
+			close(done)
+			select {
+			case id := <-stops:
+				is.Equal(id, taskID)
+			case <-time.After(never):
+				is.Fail()
+			}
+			select {
+			case <-run:
+				is.Fail()
+			default:
+			}
+
+			cancel()
+			select {
+			case err := <-run:
+				is.True(errors.Is(err, context.Canceled))
+			case <-time.After(never):
+				is.Fail()
 			}
 		})
 	})
@@ -969,7 +988,6 @@ func TestKernelStop(t *testing.T) {
 				is.NoErr(err)
 				return m
 			}
-			// C depends on B depends on A: stop must walk C, B, A.
 			k, err := popcorn.NewKernel(popcorn.WithBus(b),
 				popcorn.WithParallelism(2),
 				popcorn.WithModules(mk("c", "b"), mk("b", "a"), mk("a")))
@@ -988,12 +1006,12 @@ func TestKernelStop(t *testing.T) {
 				is.Equal(<-stops, "b")
 				is.Equal(<-stops, "a")
 			case <-time.After(never):
-				is.Fail() // stop functions never ran
+				is.Fail()
 			}
 			select {
 			case <-done:
 			case <-time.After(never):
-				is.Fail() // kernel did not finish shutdown
+				is.Fail()
 			}
 		})
 	})
@@ -1005,9 +1023,6 @@ func TestKernelStop(t *testing.T) {
 
 			b := newBus(t, popcorn.WithReplayBuffer(8))
 
-			// Each StopFunc waits until the other has entered, so the pair can
-			// only finish if the kernel runs both concurrently; a serialized
-			// wave blocks forever and synctest reports the deadlock.
 			var entered sync.WaitGroup
 			entered.Add(2)
 			stop := concurrentStop(&entered)
@@ -1035,11 +1050,11 @@ func TestKernelStop(t *testing.T) {
 			waitRunning(is, b)
 			cancel()
 
-			entered.Wait() // returns only once both stops ran concurrently
+			entered.Wait()
 			select {
 			case <-done:
 			case <-time.After(never):
-				is.Fail() // kernel did not finish shutdown
+				is.Fail()
 			}
 		})
 	})
@@ -1054,7 +1069,7 @@ func TestKernelStop(t *testing.T) {
 
 			slowStop := func(stopCtx context.Context) error {
 				_, ok := stopCtx.Deadline()
-				stopDeadlines <- ok // each StopFunc gets a stop deadline
+				stopDeadlines <- ok
 				select {
 				case <-time.After(2 * never):
 					return nil
@@ -1076,7 +1091,7 @@ func TestKernelStop(t *testing.T) {
 				Start: func(context.Context) (popcorn.StopFunc, error) {
 					return func(stopCtx context.Context) error {
 						_, ok := stopCtx.Deadline()
-						stopDeadlines <- ok // a deadline must be present here too
+						stopDeadlines <- ok
 						return nil
 					}, nil
 				},
@@ -1096,12 +1111,12 @@ func TestKernelStop(t *testing.T) {
 			waitRunning(is, b)
 			cancel()
 
-			is.True(<-stopDeadlines) // slow module's stop carries a stop deadline
-			is.True(<-stopDeadlines) // fast module's stop carries a stop deadline
+			is.True(<-stopDeadlines)
+			is.True(<-stopDeadlines)
 			select {
 			case <-done:
 			case <-time.After(never):
-				is.Fail() // kernel did not finish shutdown
+				is.Fail()
 			}
 		})
 	})
@@ -1120,7 +1135,7 @@ func TestKernelStop(t *testing.T) {
 					ID: id,
 					Start: func(context.Context) (popcorn.StopFunc, error) {
 						entered <- struct{}{}
-						<-block // ignores ctx and keeps its worker slot
+						<-block
 						return noStop, nil
 					},
 				})
@@ -1145,7 +1160,7 @@ func TestKernelStop(t *testing.T) {
 			select {
 			case <-done:
 			case <-time.After(never):
-				is.Fail() // shutdown must not outlive the stop budget
+				is.Fail()
 			}
 		})
 	})
@@ -1157,7 +1172,7 @@ func TestKernelStop(t *testing.T) {
 
 			b := newBus(t, popcorn.WithReplayBuffer(8))
 			release := make(chan struct{})
-			defer close(release) // unblock the abandoned StopFunc so it cannot leak
+			defer close(release)
 			entered := make(chan struct{}, 1)
 
 			m, err := popcorn.NewModule(popcorn.ModRecipe{
@@ -1165,7 +1180,7 @@ func TestKernelStop(t *testing.T) {
 				Start: func(context.Context) (popcorn.StopFunc, error) {
 					return func(context.Context) error {
 						entered <- struct{}{}
-						<-release // ignores the stop context
+						<-release
 						return nil
 					}, nil
 				},
@@ -1189,39 +1204,116 @@ func TestKernelStop(t *testing.T) {
 			select {
 			case <-done:
 			case <-time.After(never):
-				is.Fail() // a runaway StopFunc must not hang shutdown past the budget
+				is.Fail()
 			}
 		})
 	})
 
-	t.Run("exit when idle stops while a peer is still starting", func(t *testing.T) {
+	t.Run("a finished task does not stop a long-running peer", func(t *testing.T) {
 		t.Parallel()
 		synctest.Test(t, func(t *testing.T) {
 			is := is.New(t)
 
 			b := newBus(t, popcorn.WithReplayBuffer(8))
-			block := make(chan struct{})
-			defer close(block)
-			blocked, err := popcorn.NewModule(popcorn.ModRecipe{
-				ID:    "blocked",
-				Start: func(context.Context) (popcorn.StopFunc, error) { <-block; return noStop, nil },
-			})
+			peer, err := popcorn.NewModule(popcorn.ModRecipe{ID: peerID, Start: noopStart})
 			is.NoErr(err)
 			task, err := popcorn.NewModule(popcorn.ModRecipe{
 				ID: taskID, Done: closeOnStart(), Start: noopStart,
 			})
 			is.NoErr(err)
 
-			k, err := popcorn.NewKernel(popcorn.WithBus(b),
-				popcorn.WithParallelism(2),
-				popcorn.WithExitWhenIdle(true),
-				popcorn.WithModules(blocked, task))
+			k, err := popcorn.NewKernel(popcorn.WithBus(b), popcorn.WithModules(peer, task))
 			is.NoErr(err)
 
-			ctx, cancel := within()
+			ctx, cancel := context.WithCancel(context.Background())
 			defer cancel()
+			done := make(chan error, 1)
+			go func() { done <- k.Start(ctx) }()
+			waitRunning(is, b)
 
-			is.True(errors.Is(k.Start(ctx), popcorn.ErrKernelStopped)) // a done task ends the run
+			select {
+			case <-done:
+				is.Fail()
+			default:
+			}
+			cancel()
+			select {
+			case err := <-done:
+				is.True(errors.Is(err, context.Canceled))
+			case <-time.After(never):
+				is.Fail()
+			}
+		})
+	})
+
+	t.Run("cancellation releases a dependent waiting for a task", func(t *testing.T) {
+		t.Parallel()
+		synctest.Test(t, func(t *testing.T) {
+			is := is.New(t)
+
+			b := newBus(t, popcorn.WithReplayBuffer(8))
+			done := make(chan struct{})
+			task, err := popcorn.NewModule(popcorn.ModRecipe{ID: taskID, Done: done, Start: noopStart})
+			is.NoErr(err)
+			dependent, err := popcorn.NewModule(popcorn.ModRecipe{
+				ID: "dependent", Dependencies: []string{taskID}, Start: noopStart,
+			})
+			is.NoErr(err)
+
+			k, err := popcorn.NewKernel(popcorn.WithBus(b), popcorn.WithModules(task, dependent))
+			is.NoErr(err)
+
+			ctx, cancel := context.WithCancel(context.Background())
+			defer cancel()
+			run := make(chan error, 1)
+			go func() { run <- k.Start(ctx) }()
+			synctest.Wait()
+
+			cancel()
+			select {
+			case err := <-run:
+				is.True(errors.Is(err, context.Canceled))
+			case <-time.After(never):
+				is.Fail()
+			}
+		})
+	})
+
+	t.Run("a task stop failure is logged", func(t *testing.T) {
+		t.Parallel()
+		synctest.Test(t, func(t *testing.T) {
+			is := is.New(t)
+
+			b := newBus(t, popcorn.WithReplayBuffer(8))
+			var logBuf strings.Builder
+			done := make(chan struct{})
+			task, err := popcorn.NewModule(popcorn.ModRecipe{
+				ID: taskID, Done: done,
+				Start: func(context.Context) (popcorn.StopFunc, error) {
+					return func(context.Context) error { return errBoom }, nil
+				},
+			})
+			is.NoErr(err)
+			peer, err := popcorn.NewModule(popcorn.ModRecipe{ID: peerID, Start: noopStart})
+			is.NoErr(err)
+
+			k, err := popcorn.NewKernel(popcorn.WithBus(b),
+				popcorn.WithLogger(slog.New(slog.NewTextHandler(&logBuf, nil))),
+				popcorn.WithModules(task, peer))
+			is.NoErr(err)
+
+			ctx, cancel := context.WithCancel(context.Background())
+			defer cancel()
+			run := make(chan error, 1)
+			go func() { run <- k.Start(ctx) }()
+			waitRunning(is, b)
+
+			close(done)
+			synctest.Wait()
+			is.True(strings.Contains(logBuf.String(), "task stop failed"))
+
+			cancel()
+			<-run
 		})
 	})
 }
@@ -1241,7 +1333,7 @@ func TestKernelLateFinish(t *testing.T) {
 				ID: "late",
 				Start: func(context.Context) (popcorn.StopFunc, error) {
 					entered <- struct{}{}
-					<-release // outlives the shutdown attempt
+					<-release
 					return func(context.Context) error { stopped <- struct{}{}; return nil }, nil
 				},
 			})
@@ -1260,14 +1352,14 @@ func TestKernelLateFinish(t *testing.T) {
 			select {
 			case <-done:
 			case <-time.After(never):
-				is.Fail() // kernel did not stop after cancel
+				is.Fail()
 			}
 
 			close(release)
 			select {
 			case <-stopped:
 			case <-time.After(never):
-				is.Fail() // a module that finishes starting during shutdown must be stopped
+				is.Fail()
 			}
 		})
 	})
@@ -1295,7 +1387,7 @@ func TestKernelLateFinish(t *testing.T) {
 					ID: id, Dependencies: []string{fastID},
 					Start: func(context.Context) (popcorn.StopFunc, error) {
 						entered <- struct{}{}
-						<-block // holds its worker slot, ignoring ctx
+						<-block
 						return noStop, nil
 					},
 				})
@@ -1320,12 +1412,12 @@ func TestKernelLateFinish(t *testing.T) {
 			select {
 			case <-done:
 			case <-time.After(never):
-				is.Fail() // shutdown must not outlive the stop budget
+				is.Fail()
 			}
 			select {
 			case <-stoppedFast:
 			case <-time.After(never):
-				is.Fail() // a started peer must still be stopped
+				is.Fail()
 			}
 		})
 	})
@@ -1359,7 +1451,7 @@ func TestKernelLateFinish(t *testing.T) {
 					case entered <- struct{}{}:
 					default:
 					}
-					<-release // park the ModuleStarted publish mid-lifecycle
+					<-release
 				}
 				return true
 			}))
@@ -1387,13 +1479,13 @@ func TestKernelLateFinish(t *testing.T) {
 					stoppingAt = i
 				}
 			}
-			is.True(stoppingAt >= 0) // the kernel must reach stopping
+			is.True(stoppingAt >= 0)
 			for i, ev := range timeline {
 				if strings.HasPrefix(ev, "started:") {
-					is.True(i < stoppingAt) // ModuleStarted must be delivered before stopping
+					is.True(i < stoppingAt)
 				}
 				if i > stoppingAt {
-					is.True(ev != "state:running") // stopping must never regress to running
+					is.True(ev != "state:running")
 				}
 			}
 		})
@@ -1410,14 +1502,14 @@ func TestKernelCoordination(t *testing.T) {
 
 			b := newBus(t, popcorn.WithReplayBuffer(8))
 			_, err := b.Subscribe("kernel", popcorn.WithBacklog(1))
-			is.NoErr(err) // the reserved id is ours for this test
+			is.NoErr(err)
 
 			m, err := popcorn.NewModule(popcorn.ModRecipe{ID: "m", Start: noopStart})
 			is.NoErr(err)
 			k, err := popcorn.NewKernel(popcorn.WithBus(b), popcorn.WithModules(m))
 			is.NoErr(err)
 
-			is.True(k.Start(context.Background()) != nil) // a taken health stream must fail the start
+			is.True(k.Start(context.Background()) != nil)
 		})
 	})
 
@@ -1427,8 +1519,6 @@ func TestKernelCoordination(t *testing.T) {
 			is := is.New(t)
 
 			b := newBus(t, popcorn.WithReplayBuffer(8))
-			// A NOK from before the kernel exists is replayed into the health
-			// stream and must be dropped, not treated as a live failure.
 			is.NoErr(b.Publisher("ghost").Send(context.Background(),
 				popcorn.NewEvent(popcorn.ModuleStateChanged{To: popcorn.ModuleStateNOK, Cause: errBoom})))
 
@@ -1442,7 +1532,7 @@ func TestKernelCoordination(t *testing.T) {
 			ctx, cancel := within()
 			defer cancel()
 
-			is.True(errors.Is(k.Start(ctx), popcorn.ErrKernelStopped)) // a stale NOK must not fail the run
+			is.True(errors.Is(k.Start(ctx), popcorn.ErrKernelStopped))
 		})
 	})
 
@@ -1458,7 +1548,7 @@ func TestKernelCoordination(t *testing.T) {
 			stuck, err := popcorn.NewModule(popcorn.ModRecipe{
 				ID: "stuck",
 				Start: func(context.Context) (popcorn.StopFunc, error) {
-					<-block // never returns, so its dependent is never released
+					<-block
 					return noStop, nil
 				},
 			})
@@ -1478,7 +1568,7 @@ func TestKernelCoordination(t *testing.T) {
 			ctx, cancel := within()
 			defer cancel()
 
-			is.True(!errors.Is(k.Start(ctx), popcorn.ErrKernelStopped)) // the NOK must fail the run
+			is.True(!errors.Is(k.Start(ctx), popcorn.ErrKernelStopped))
 		})
 	})
 
@@ -1491,14 +1581,11 @@ func TestKernelCoordination(t *testing.T) {
 			block := make(chan struct{})
 			defer close(block)
 
-			// With a single start slot, one module holds it and blocks while the
-			// other parks waiting for it; canceling the run must release the
-			// waiter through the halt signal rather than by freeing the slot.
 			mk := func(id string) popcorn.Module {
 				m, err := popcorn.NewModule(popcorn.ModRecipe{
 					ID: id,
 					Start: func(context.Context) (popcorn.StopFunc, error) {
-						<-block // ignores cancellation, holds the only slot
+						<-block
 						return noStop, nil
 					},
 				})
@@ -1515,10 +1602,10 @@ func TestKernelCoordination(t *testing.T) {
 			defer cancel()
 			done := make(chan error, 1)
 			go func() { done <- k.Start(ctx) }()
-			synctest.Wait() // one module holds the slot, the other is parked on it
+			synctest.Wait()
 			cancel()
 
-			is.True(errors.Is(<-done, context.Canceled)) // a canceled run returns the context error
+			is.True(errors.Is(<-done, context.Canceled))
 		})
 	})
 }

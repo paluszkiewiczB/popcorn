@@ -12,9 +12,6 @@ import (
 	"github.com/paluszkiewiczB/popcorn"
 )
 
-// The hermetic end-to-end contracts: whole-system behavior inside one
-// process - no network, no example code.
-
 func TestE2EPingStory(t *testing.T) {
 	t.Parallel()
 	synctest.Test(t, func(t *testing.T) {
@@ -26,7 +23,6 @@ func TestE2EPingStory(t *testing.T) {
 		producerDone := make(chan struct{})
 		collectorDone := make(chan struct{})
 
-		// producer: sends `rounds` pings, then signals done.
 		producerStart := func(ctx context.Context) (popcorn.StopFunc, error) {
 			pub := b.Publisher("producer")
 			for i := range rounds {
@@ -38,8 +34,6 @@ func TestE2EPingStory(t *testing.T) {
 			return noStop, nil
 		}
 
-		// collector: subscribes into the bus itself, acknowledges health,
-		// then finishes once a full round is seen.
 		received := make(chan []int, 1)
 
 		collectorStart := func(ctx context.Context) (popcorn.StopFunc, error) {
@@ -78,10 +72,9 @@ func TestE2EPingStory(t *testing.T) {
 		}
 
 		producer, err := popcorn.NewModule(popcorn.ModRecipe{
-			ID:           "producer",
-			Dependencies: []string{"collector"},
-			Start:        producerStart,
-			Done:         producerDone,
+			ID:    "producer",
+			Start: producerStart,
+			Done:  producerDone,
 		})
 		is.NoErr(err)
 
@@ -100,15 +93,13 @@ func TestE2EPingStory(t *testing.T) {
 		ctx, cancel := within()
 		defer cancel()
 
-		// Both modules are TaskModules that report Done; the kernel must exit
-		// gracefully once both are done.
 		is.True(errors.Is(k.Start(ctx), popcorn.ErrKernelStopped))
 
 		select {
 		case got := <-received:
-			is.Equal(got, []int{0, 1, 2}) // collector must see every published ping exactly once
+			is.Equal(got, []int{0, 1, 2})
 		case <-time.After(never):
-			is.Fail() // collector never received a full round
+			is.Fail()
 		}
 	})
 }
@@ -129,9 +120,6 @@ func TestE2EFailurePath(t *testing.T) {
 		})
 		is.NoErr(err)
 
-		// Healthy long-running peer: must receive a stop call once the fleet
-		// shuts down due to the NOK report - failures shut the fleet down,
-		// they do not abandon it.
 		healthy, err := popcorn.NewModule(popcorn.ModRecipe{
 			ID:           "healthy",
 			Dependencies: []string{failingID},
@@ -149,8 +137,6 @@ func TestE2EFailurePath(t *testing.T) {
 		ctx, cancel := within()
 		defer cancel()
 
-		// Let the whole fleet come up and only then report the failure, so the
-		// NOK genuinely tests shutdown rather than start cancellation.
 		done := make(chan error, 1)
 		go func() { done <- k.Start(ctx) }()
 		waitRunning(is, b)
@@ -166,9 +152,9 @@ func TestE2EFailurePath(t *testing.T) {
 
 		select {
 		case id := <-stops:
-			is.Equal(id, "healthy") // the healthy peer must be stopped on NOK shutdown
+			is.Equal(id, "healthy")
 		case <-time.After(never):
-			is.Fail() // healthy peer never got a stop call
+			is.Fail()
 		}
 	})
 }

@@ -7,20 +7,22 @@ import (
 )
 
 // Module is a self-contained unit of functionality managed by the Kernel. The
-// Kernel starts a module only after every dependency's Start has returned, and
-// calls its StopFunc during shutdown.
+// Kernel starts a module only after every dependency has completed, and calls
+// its StopFunc at shutdown; a TaskModule's StopFunc runs as soon as its Done
+// closes instead.
 type Module interface {
 	// ID is the module's unique, non-empty identifier. By convention it is the
 	// module's import path. The kernel reserves "kernel" for itself.
 	ID() string
 
-	// Dependencies returns the ids of the modules that must be started before
-	// this one. A dependency is started once its Start returns, for a TaskModule
-	// just like any other module.
+	// Dependencies returns the ids of the modules that must complete before this
+	// one. A plain Module completes when its Start returns; a TaskModule when its
+	// Done closes.
 	Dependencies() []string
 
 	// Start initializes the module and returns the StopFunc that the kernel
-	// invokes during shutdown; the StopFunc may be nil.
+	// invokes; the StopFunc may be nil. It runs at shutdown, or as soon as a
+	// TaskModule's Done closes.
 	//
 	// A module that consumes events holds the Bus like any other dependency and
 	// subscribes itself:
@@ -44,9 +46,11 @@ type Module interface {
 
 // TaskModule is a Module that performs finite work and signals completion.
 //
-// The kernel exits once there is at least one TaskModule and all of them are
-// done; see [WithExitWhenIdle]. Done does not gate dependents: a dependent
-// starts once this module's Start returns, like with any dependency.
+// A TaskModule completes when Done closes, and its dependents wait for Done, so
+// a task gates startup by finishing rather than by starting. When every module
+// in the kernel is a TaskModule, the kernel exits once all are done; a graph
+// with any long-running Module runs until the context is canceled or a module
+// fails.
 type TaskModule interface {
 	Module
 
@@ -61,9 +65,9 @@ type StartFunc func(ctx context.Context) (StopFunc, error)
 // the run context (values preserved, own deadline).
 type StopFunc func(ctx context.Context) error
 
-// StopFuncFromCloser adapts an io.Closer to a StopFunc. It returns nil for a nil
-// closer, so `return popcorn.StopFuncFromCloser(c), nil` is safe.
-func StopFuncFromCloser(c io.Closer) StopFunc {
+// StopCloser adapts an io.Closer to a StopFunc. It returns nil for a nil closer,
+// so `return popcorn.StopCloser(c), nil` is safe.
+func StopCloser(c io.Closer) StopFunc {
 	if c == nil {
 		return nil
 	}
@@ -76,12 +80,14 @@ func StopFuncFromCloser(c io.Closer) StopFunc {
 type ModRecipe struct {
 	// ID is the module's unique, non-empty identifier. "kernel" is reserved.
 	ID string
-	// Dependencies lists the ids of the modules that must start before this one.
+	// Dependencies lists the ids of the modules that must complete before this
+	// one: a plain module when its Start returns, a TaskModule when its Done
+	// closes.
 	Dependencies []string
-	// Start initializes the module and returns the StopFunc invoked on shutdown.
+	// Start initializes the module and returns the StopFunc the kernel invokes.
 	Start StartFunc
-	// Done, when non-nil, makes the module a TaskModule; it must be closed when
-	// the module's work is finished.
+	// Done, when non-nil, makes the module a TaskModule; close it when the
+	// module's work is finished. Dependents wait for it to close.
 	Done <-chan struct{}
 }
 
